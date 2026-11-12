@@ -154,6 +154,42 @@ class GuardTests(unittest.TestCase):
         (self.repo / "app.py").write_text("print(2)\n", encoding="utf-8")
         self.assertIn("app.py", self.hook("stop", {"status": "completed"})["followup_message"])
 
+    # protected check configuration
+
+    def rules_file(self) -> None:
+        (self.repo / ".governance").mkdir(exist_ok=True)
+        (self.repo / ".governance" / "rules.json").write_text('{"version": 1, "rules": []}', encoding="utf-8")
+
+    def test_check_configs_are_free_in_a_project_without_rules(self) -> None:
+        self.assertEqual(self.edit("ruff.toml"), {})
+        self.assertEqual(self.edit("tsconfig.json"), {})
+
+    def test_agent_cannot_loosen_the_checks_without_the_owner_seeing_it(self) -> None:
+        self.rules_file()
+        for path in ("ruff.toml", "eslint.config.mjs", "tsconfig.json", "tsconfig.build.json", ".governance/rules.json",
+                     ".github/workflows/governance.yml", ".governance/baseline.json"):
+            self.assertEqual(self.edit(path).get("permission"), "deny", path)
+        self.assertEqual(self.edit("src/app.py"), {})
+        self.assertEqual(self.edit("packages/web/tsconfig.json"), {})
+        self.freeze()
+        self.assertIn("outputs", self.edit("ruff.toml")["agent_message"])
+
+    def test_a_check_config_named_in_the_frozen_contract_can_be_edited(self) -> None:
+        self.rules_file()
+        (self.repo / "ruff.toml").write_text("line-length = 120\n", encoding="utf-8")
+        (self.repo / "stage.json").write_text(json.dumps({**CONTRACT, "outputs": ["ruff.toml"]}), encoding="utf-8")
+        self.freeze()
+        self.assertEqual(self.edit("ruff.toml"), {})
+        self.assertEqual(self.edit("eslint.config.mjs").get("permission"), "deny")
+        self.assertEqual(self.edit(".governance/baseline.json").get("permission"), "deny")
+
+    def test_owner_can_protect_more_files(self) -> None:
+        self.rules_file()
+        (self.repo / ".governance" / "config.json").write_text(
+            json.dumps({"version": 1, "require_stage": False, "protected": ["pyproject.toml"]}), encoding="utf-8")
+        self.assertEqual(self.edit("pyproject.toml").get("permission"), "deny")
+        self.assertEqual(self.edit("README.md"), {})
+
 
 if __name__ == "__main__":
     unittest.main()

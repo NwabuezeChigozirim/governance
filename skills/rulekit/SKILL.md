@@ -24,7 +24,7 @@ In an adopted project the tools are at `tools/governance/`. Run them as `python 
 
    If the mistake fits none of these, go back to the **correct** skill's ladder: a type, a test, or the project's linter.
 
-2. **Add it to `.governance/rules.json`** with the next free ID:
+2. **Add it to `.governance/rules.json`** with the next free ID. The hook lets you edit this file only when the frozen contract lists `.governance/rules.json` in its `outputs`, so put it there before the owner freezes the stage:
 
    ```json
    {"id": "R-002", "kind": "ban-import", "include": ["src/renderer/**"], "forbid": ["src/main"],
@@ -56,5 +56,5 @@ In an adopted project the tools are at `tools/governance/`. Run them as `python 
 
 - The baseline only shrinks. If `baseline` refuses because a count would grow, fix the new violation. Growing it takes the owner running `rulekit baseline --owner-approved`; the hook blocks you from running that.
 - Never widen `allow`, narrow `include`, add to `exclude`, or loosen a `pattern` to make a failure go away. A rule change is its own stage, with the owner approving the contract.
-- A `linter` rule is only as strict as the tool's config file (`ruff.toml`, `eslint.config.mjs`, `tsconfig.json`). Never relax that file, add a suppression comment, or cast a type away to get past a finding. Exit 127 means the tool is not installed: install it, do not remove the rule.
+- A `linter` rule is only as strict as the tool's config file (`ruff.toml`, `eslint.config.mjs`, `tsconfig.json`). The hook blocks edits to those files, to `.governance/rules.json` and to the governance workflow unless the frozen contract lists the file in `outputs`, and blocks hand edits to the baseline always. Never relax a config, add a suppression comment, or cast a type away to get past a finding. Exit 127 means the tool is not installed: install it, do not remove the rule.
 - `ban-comments` understands Python and C-style languages. `ban-import` resolves relative imports and Python modules; path aliases need `forbid_specifiers`. Say so when a rule depends on something it cannot see.

@@ -46,6 +46,10 @@ _loader.exec_module(verifyctl)
 CONFIG = ".governance/config.json"
 RECEIPTS = ".governance/receipts"
 ALWAYS_EXEMPT = (RECEIPTS + "/**", ".governance/stages/**")
+RULES = ".governance/rules.json"
+BASELINE = ".governance/baseline.json"
+ALWAYS_PROTECTED = (RULES, "ruff.toml", ".ruff.toml", "mypy.ini", ".mypy.ini", "eslint.config.*", ".eslintrc*",
+                    "tsconfig*.json", ".github/workflows/governance.yml")
 CONTRACT_FIELDS = {"version", "name", "intent", "review", "inputs", "outputs", "acceptance", "checks"}
 REVIEWS = ("independent", "none")
 VAGUE = re.compile(r"^(todo|tbd|n/?a|none|placeholder|\.+)$", re.IGNORECASE)
@@ -195,12 +199,21 @@ def config(root: Path) -> dict[str, Any]:
     """Project settings. Absent file: stages are optional and nothing is exempt."""
     value = read_json(root / CONFIG)
     if value is None:
-        return {"require_stage": False, "exempt": []}
-    exempt = value.get("exempt", []) if isinstance(value, dict) else None
+        return {"require_stage": False, "exempt": [], "protected": []}
+    lists = [value.get(key, []) for key in ("exempt", "protected")] if isinstance(value, dict) else [None]
     if (not isinstance(value, dict) or type(value.get("require_stage", False)) is not bool
-            or not isinstance(exempt, list) or any(not isinstance(item, str) or not item for item in exempt)):
-        raise Invalid(f"{CONFIG}: expected require_stage (true or false) and exempt (a list of path globs)")
-    return {"require_stage": value.get("require_stage", False), "exempt": exempt}
+            or any(not isinstance(items, list) or any(not isinstance(item, str) or not item for item in items)
+                   for items in lists)):
+        raise Invalid(f"{CONFIG}: expected require_stage (true or false), and exempt and protected (lists of path globs)")
+    return {"require_stage": value.get("require_stage", False), "exempt": lists[0], "protected": lists[1]}
+
+
+def protected(root: Path, relative: str, settings: dict[str, Any] | None = None) -> bool:
+    """Files that set how strict the checks are, in a project that has a rule file."""
+    if not (root / RULES).is_file():
+        return False
+    patterns = [*ALWAYS_PROTECTED, *(settings or config(root))["protected"]]
+    return any(glob_regex(pattern).match(relative) for pattern in patterns)
 
 
 def exempt(root: Path, relative: str, settings: dict[str, Any] | None = None) -> bool:
