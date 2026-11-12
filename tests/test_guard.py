@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -105,6 +106,17 @@ class GuardTests(unittest.TestCase):
 
     def edit(self, path: str, tool: str = "Write") -> dict:
         return self.hook("pre-tool-use", {"tool_name": tool, "tool_input": {"file_path": path}})
+
+    def test_planning_documents_need_no_stage_under_the_adoption_defaults(self) -> None:
+        spec = importlib.util.spec_from_file_location("adopt", PACKAGE / "scripts" / "adopt.py")
+        adopt = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adopt)
+        self.require_stage(exempt=list(adopt.PLANNING_DOCS))
+        for path in ("GLOSSARY.md", "src/billing/GLOSSARY.md", "docs/adr/0001-queue.md", "docs/agents/issue-tracker.md",
+                     ".scratch/archive/issues/01-archive.md"):
+            self.assertEqual(self.edit(path), {}, path)
+        for path in ("src/app.py", "AGENTS.md", "docs/guide.md"):
+            self.assertEqual(self.edit(path).get("permission"), "deny", path)
 
     def test_edits_are_free_in_a_project_that_did_not_opt_in(self) -> None:
         self.assertEqual(self.edit("src/app.py"), {})

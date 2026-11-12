@@ -152,6 +152,9 @@ NODE_SETUP = """      - uses: actions/setup-node@v4
 """
 
 
+PLANNING_DOCS = ("GLOSSARY.md", "GLOSSARY-MAP.md", "**/GLOSSARY.md", "docs/adr/**", "**/docs/adr/**",
+                 "docs/agents/**", ".scratch/**")
+
 def tracked_files(repo: Path) -> list[str]:
     result = subprocess.run(["git", "-C", str(repo), "ls-files", "-co", "--exclude-standard"],
                             capture_output=True, text=True, check=False)
@@ -215,7 +218,7 @@ def adopt(repo: Path) -> list[str]:
         rules.append({"id": rule_id, **preset["entry"]})
         rows.append((rule_id, preset["rule"], preset["level"], bad))
         examples[bad] = preset["bad"]
-    fresh = create(governance / "config.json", json.dumps({"version": 1, "require_stage": True, "exempt": [], "protected": []}, indent=2) + "\n", done)
+    fresh = create(governance / "config.json", json.dumps({"version": 1, "require_stage": True, "exempt": list(PLANNING_DOCS), "protected": []}, indent=2) + "\n", done)
     fresh = create(governance / "rules.json", json.dumps(
         {"version": 1, "exclude": ["tools/governance/**"], "rules": rules}, indent=2) + "\n", done)
     if fresh:

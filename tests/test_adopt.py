@@ -49,7 +49,10 @@ class AdoptTests(unittest.TestCase):
         self.assertTrue((self.repo / ".governance" / "bad" / "R-001.ts").is_file())
         self.assertEqual(self.tool("rulekit", "check"), 0)
         self.assertEqual(self.tool("rulectl", "check", "--repo", ".", "--prove"), 0)
-        self.assertTrue(json.loads((self.repo / ".governance/config.json").read_text())["require_stage"])
+        config = json.loads((self.repo / ".governance/config.json").read_text())
+        self.assertTrue(config["require_stage"])
+        for glob in ("GLOSSARY.md", "docs/adr/**", "docs/agents/**", ".scratch/**"):
+            self.assertIn(glob, config["exempt"])
         self.assertIn(".verify/", (self.repo / ".gitignore").read_text().splitlines())
         self.assertIn("stagectl gate", (self.repo / ".github/workflows/governance.yml").read_text())
 

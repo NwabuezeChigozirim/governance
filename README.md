@@ -30,7 +30,7 @@ python scripts/adopt.py --repo path/to/project
 | It adds | Effect |
 |---|---|
 | `tools/governance/` | `stagectl`, `verifyctl`, `rulectl`, `rulekit`, so CI and the terminal can run them |
-| `.governance/config.json` | `require_stage: true`: the hook blocks an agent's file edits until a stage is frozen. `exempt` lists path globs that need no stage |
+| `.governance/config.json` | `require_stage: true`: the hook blocks an agent's file edits until a stage is frozen. `exempt` lists path globs that need no stage. It starts with the planning documents the `intent` plugin writes outside a stage: `GLOSSARY.md`, `docs/adr/`, `docs/agents/` and `.scratch/` |
 | `.governance/rules.json`, `bad/R-*.*`, `baseline.json` | Starter rules, each with a bad example, and a baseline of today's violations. R-001: no comments in source files. R-002: no source file over 400 lines. Then the strict preset for the language |
 | `ruff.toml` or `eslint.config.mjs` | Strict linter settings, only when the project has none |
 | `AGENTS.md` | A `## Rules` table listing the starter rules |
