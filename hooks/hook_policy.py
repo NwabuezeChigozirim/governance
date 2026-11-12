@@ -22,7 +22,8 @@ GLOBAL_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-
 GLOBAL_FLAGS = {"--no-pager", "--paginate", "-P", "-p", "--bare", "--no-replace-objects",
                 "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs",
                 "--no-optional-locks", "--no-lazy-fetch"}
-READ_TOOLS = {"read", "readfile", "read_file", "glob", "grep", "ls"}
+READ_TOOLS = {"read", "readfile", "read_file", "glob", "grep", "ls", "list_dir", "listdir", "search",
+              "semanticsearch", "codebase_search", "readlints", "read_lints"}
 
 
 def validate_payload(value: Any) -> dict[str, Any]:

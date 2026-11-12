@@ -93,6 +93,67 @@ class GuardTests(unittest.TestCase):
         self.stagectl("close")
         self.assertEqual(self.hook("stop", {"status": "completed"}), {})
 
+    # require_stage
+
+    def require_stage(self, exempt: list[str] | None = None) -> None:
+        (self.repo / ".governance").mkdir(exist_ok=True)
+        (self.repo / ".governance" / "config.json").write_text(
+            json.dumps({"version": 1, "require_stage": True, "exempt": exempt or []}), encoding="utf-8")
+        git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "adopt"], check=True)
+
+    def edit(self, path: str, tool: str = "Write") -> dict:
+        return self.hook("pre-tool-use", {"tool_name": tool, "tool_input": {"file_path": path}})
+
+    def test_edits_are_free_in_a_project_that_did_not_opt_in(self) -> None:
+        self.assertEqual(self.edit("src/app.py"), {})
+
+    def test_edits_need_a_stage_once_the_project_requires_one(self) -> None:
+        self.require_stage(exempt=["docs/**"])
+        denied = self.edit("src/app.py")
+        self.assertEqual(denied.get("permission"), "deny")
+        self.assertIn(".governance/stages/", denied["agent_message"])
+        self.assertEqual(self.edit(str(self.repo / "src" / "app.py")).get("permission"), "deny")
+        self.assertEqual(self.edit("src/app.py", tool="Read"), {})
+        self.assertEqual(self.edit("docs/guide.md"), {})
+        self.assertEqual(self.edit(".governance/stages/totals.json"), {})
+        self.assertEqual(self.edit(str(self.repo.parent / "elsewhere.txt")), {})
+        self.freeze()
+        self.assertEqual(self.edit("src/app.py"), {})
+
+    def test_agent_cannot_edit_the_config_or_write_a_receipt(self) -> None:
+        self.assertEqual(self.edit(".governance/receipts/ST-x.json").get("permission"), "deny")
+        self.require_stage()
+        self.freeze()
+        self.assertEqual(self.edit(".governance/config.json").get("permission"), "deny")
+        self.assertEqual(self.edit(".governance/receipts/ST-x.json").get("permission"), "deny")
+
+    def test_agent_cannot_grow_the_rule_baseline(self) -> None:
+        self.assertEqual(self.shell("python tools/governance/rulekit baseline --owner-approved").get("permission"), "deny")
+        self.assertEqual(self.shell("python tools/governance/rulekit baseline"), {})
+
+    def test_stop_reports_changes_made_without_a_stage(self) -> None:
+        self.require_stage(exempt=["docs/**"])
+        self.assertEqual(self.hook("stop", {"status": "completed"}), {})
+        (self.repo / "docs").mkdir()
+        (self.repo / "docs" / "guide.md").write_text("x\n", encoding="utf-8")
+        self.assertEqual(self.hook("stop", {"status": "completed"}), {})
+        (self.repo / "app.py").write_text("print(1)\n", encoding="utf-8")
+        message = self.hook("stop", {"status": "completed"})["followup_message"]
+        self.assertIn("app.py", message)
+        self.assertNotIn("guide.md", message)
+
+    def test_stop_is_quiet_after_a_stage_closed_on_the_current_code(self) -> None:
+        self.require_stage()
+        (self.repo / "app.py").write_text("print(1)\n", encoding="utf-8")
+        self.freeze()
+        self.stagectl("run-check", "--all")
+        self.stagectl("close")
+        self.assertEqual(self.hook("stop", {"status": "completed"}), {})
+        (self.repo / "app.py").write_text("print(2)\n", encoding="utf-8")
+        self.assertIn("app.py", self.hook("stop", {"status": "completed"})["followup_message"])
+
 
 if __name__ == "__main__":
     unittest.main()

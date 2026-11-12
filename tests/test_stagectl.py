@@ -43,6 +43,7 @@ class StagectlTests(unittest.TestCase):
         self.git("commit", "-q", "-m", "base")
 
     def write(self, name: str, text: str) -> None:
+        (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
         (self.repo / name).write_text(text, encoding="utf-8")
 
     def git(self, *args: str) -> None:
@@ -81,7 +82,7 @@ class StagectlTests(unittest.TestCase):
         self.assertEqual(self.ctl("status")[0], 0)
         code, out = self.ctl("close")
         self.assertEqual(code, 0, out)
-        self.assertTrue(Path(out["receipt"]).is_file())
+        self.assertTrue((self.repo / out["receipt"]).is_file())
         self.assertEqual(self.ctl("status")[0], 2)
 
     def test_repeated_identical_freeze_is_a_no_op_and_a_different_one_is_refused(self) -> None:
@@ -244,6 +245,79 @@ class StagectlTests(unittest.TestCase):
                                  "--contract", "stage.json", "--owner-approved"], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.ctl("run-check", "--all")[0], 0)
+
+    # receipt and merge gate
+
+    def proven(self) -> dict:
+        self.freeze()
+        self.assertEqual(self.ctl("run-check", "--all")[0], 0)
+        code, out = self.ctl("close")
+        self.assertEqual(code, 0, out)
+        return json.loads((self.repo / out["receipt"]).read_text(encoding="utf-8"))
+
+    def test_receipt_records_what_was_proven(self) -> None:
+        receipt = self.proven()
+        self.assertEqual(receipt["intent"], contract()["intent"])
+        self.assertEqual([c["id"] for c in receipt["checks"]], ["CHK-001"])
+        self.assertEqual(receipt["acceptance"][0]["id"], "AC-001")
+        self.assertIsNone(receipt["verdict"])
+
+    def test_gate_passes_once_the_receipt_is_committed_and_fails_after_a_later_edit(self) -> None:
+        self.assertEqual(self.ctl("gate")[0], 3)
+        self.proven()
+        self.assertEqual(self.ctl("gate")[0], 0)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "proven")
+        code, out = self.ctl("gate")
+        self.assertEqual(code, 0, out)
+        self.write("app.py", "def total(days, rate):\n    return days * rate * 1\n")
+        code, out = self.ctl("gate")
+        self.assertEqual(code, 3)
+        self.assertEqual(self.codes(out), {"no-receipt"})
+
+    def test_gate_rerun_catches_a_receipt_whose_checks_do_not_pass_here(self) -> None:
+        receipt = self.proven()
+        self.assertEqual(self.ctl("gate", "--rerun")[0], 0)
+        forged = {**receipt, "stage_id": "ST-" + "0" * 32,
+                  "checks": [{"id": "CHK-001", "argv": [sys.executable, "-c", "raise SystemExit(1)"], "timeout_seconds": 30}]}
+        (self.repo / ".governance/receipts" / f"{receipt['stage_id']}.json").unlink()
+        (self.repo / ".governance/receipts" / "ST-forged.json").write_text(json.dumps(forged), encoding="utf-8")
+        self.assertEqual(self.ctl("gate")[0], 0)
+        code, out = self.ctl("gate", "--rerun")
+        self.assertEqual(code, 3)
+        self.assertEqual(self.codes(out), {"check-failed"})
+
+    def test_gate_passes_a_change_that_touches_only_exempt_files(self) -> None:
+        self.write(".governance/config.json", json.dumps({"version": 1, "require_stage": True, "exempt": ["docs/**"]}))
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "config")
+        self.write("docs/guide.md", "How totals work.\n")
+        self.assertEqual(self.ctl("gate")[0], 3)
+        code, out = self.ctl("gate", "--base", "HEAD")
+        self.assertEqual(code, 0, out)
+        self.assertIn("no governed file", out["reason"])
+        self.write("app.py", "def total(days, rate):\n    return 0\n")
+        self.assertEqual(self.ctl("gate", "--base", "HEAD")[0], 3)
+
+    def test_gate_writes_the_receipt_as_markdown(self) -> None:
+        self.proven()
+        target = self.repo / ".verify" / "summary.md"
+        target.parent.mkdir()
+        self.assertEqual(self.ctl("gate", "--markdown", str(target))[0], 0)
+        text = target.read_text(encoding="utf-8")
+        self.assertIn(contract()["intent"], text)
+        self.assertIn("AC-001", text)
+
+    def test_gate_does_not_touch_the_real_index(self) -> None:
+        self.write("app.py", "def total(days, rate):\n    return days * rate  \n")
+        before = subprocess.run(["git", "-C", str(self.repo), "status", "--porcelain"], capture_output=True, text=True).stdout
+        self.ctl("gate")
+        after = subprocess.run(["git", "-C", str(self.repo), "status", "--porcelain"], capture_output=True, text=True).stdout
+        self.assertEqual(before, after)
+
+    def test_invalid_config_is_refused(self) -> None:
+        self.write(".governance/config.json", json.dumps({"require_stage": "yes"}))
+        self.assertEqual(self.ctl("gate")[0], 2)
 
 
 if __name__ == "__main__":

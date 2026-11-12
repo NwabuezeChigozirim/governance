@@ -18,6 +18,28 @@ the Python that ran the installer, so it works where `python3` is not on PATH (c
 on Windows). Run it again after pulling changes, then restart Cursor and start a task
 with `/govern <what you want>`. Needs Python 3.10+ and Git.
 
+## Adopt a project
+
+Installing the plugin gives Cursor the skills and hooks. A project is constrained only
+after its owner adopts it:
+
+```bash
+python scripts/adopt.py --repo path/to/project
+```
+
+| It adds | Effect |
+|---|---|
+| `tools/governance/` | `stagectl`, `verifyctl`, `rulectl`, `rulekit`, so CI and the terminal can run them |
+| `.governance/config.json` | `require_stage: true`: the hook blocks an agent's file edits until a stage is frozen. `exempt` lists path globs that need no stage |
+| `.governance/rules.json`, `bad/R-001.*`, `baseline.json` | Starter rule R-001, no comments in source files, with its bad example and a baseline of today's comments |
+| `AGENTS.md` | A `## Rules` table listing R-001 |
+| `.github/workflows/governance.yml` | On every pull request: the rules hold, every rule's proof fails as it must, and a stage receipt matches the exact code |
+| `.gitignore` | `.verify/` |
+
+It never overwrites a file that exists, apart from refreshing `tools/governance/`.
+Commit the result to the main branch directly (its own pull request has no receipt
+yet), then make the `gate` job a required check. Only then is the gate a merge gate.
+
 ## Test
 
 ```bash
@@ -68,6 +90,47 @@ command passes or cannot run, so a rule whose enforcer catches nothing is not co
 as enforced. A failing proof shows the enforcer rejects that one example, not every
 form of the mistake. `--prove` executes commands from the instruction file.
 
+### Environment: the rule kit
+
+| Piece | What it does |
+|---|---|
+| `scripts/rulekit` | A dependency-free linter driven by `.governance/rules.json`. Three kinds of rule: `ban-comments`, `ban-import` (one directory may not import from another), `ban-pattern` (a banned API or construct). Every failure prints the rule's message, which states the fix |
+| `skills/rulekit` | How an agent adds a rule: config entry, committed bad example, proof command, table row |
+
+```bash
+python tools/governance/rulekit check
+python tools/governance/rulekit check --rule R-002 --as src/renderer/x.ts .governance/bad/R-002.ts
+python tools/governance/rulekit baseline
+```
+
+The baseline records how many violations each file has today, so a rule can be switched
+on in an old codebase and fail only when a file gets worse. It only shrinks: growing it
+needs `--owner-approved`, which the hook stops an agent from passing.
+
+Limits: `ban-comments` covers Python (exact, via the tokenizer) and C-style languages
+(a scanner that skips strings, templates and most regular-expression literals; an
+unusual regex can be misread). `ban-import` resolves relative imports and Python
+modules, not bundler path aliases; use `forbid_specifiers` for those. It is a starter
+kit, not a replacement for the project's own linter and type checker.
+
+### Merge gate: the receipt
+
+| Piece | What it does |
+|---|---|
+| `stagectl close` | Also writes `.governance/receipts/<stage>.json`: intent, acceptance, checks, verdict, and the Git tree ID of the code that was proven |
+| `stagectl gate` | Passes only when a committed receipt names the tree being checked. `--base` passes a change that touches no governed file. `--rerun` runs the receipt's checks again. `--markdown` writes the receipt for the pull request or the CI summary |
+
+The tree ID leaves out Git-ignored files, receipts, contract drafts under
+`.governance/stages/` and the configured exempt paths. Any other edit after close
+changes it, so the gate fails until a new stage proves the new code.
+
+Limits: without `--rerun` the gate trusts the receipt, and a receipt is a plain file
+that an agent could write by hand through the shell (the hook only stops the edit
+tools). With `--rerun` CI runs the listed checks itself, but it cannot tell whether
+the owner approved that list. The receipt is in the diff, so a reviewer can. Runtime
+evidence (screenshots, recordings) stays local under `.verify/`; the agent attaches it
+to the pull request, and CI does not see it.
+
 ### Flow: the stage contract
 
 | Piece | What it does |
@@ -114,15 +177,26 @@ run on Linux, macOS and Windows; on Windows invoke them as `python <path>`.
 | Piece | What it does |
 |---|---|
 | `skills/govern` | The starting command. pstack's `/poteto-mode` router and its 23 playbooks, renamed, with a Governance section that wraps every change-shipping playbook in a stage |
-| `hooks/guard.py` | Blocks an agent from recording owner approval or touching stage records. While a stage is active, blocks destructive or unclassified Git commands. At the end of a turn, sends the agent back once if the stage is still unproven |
+| `hooks/guard.py` | Blocks an agent from recording owner approval, touching stage records or writing a receipt. While a stage is active, blocks destructive or unclassified Git commands. In a project with `require_stage`, blocks file edits until a stage is frozen and blocks edits to the config. At the end of a turn, sends the agent back once if the stage is unproven, or if governed files changed with no stage and no receipt |
 | `hooks/hook_policy.py` | The Git command classifier, carried over from the earlier `governance-system` |
 
 The hooks follow the layout other Cursor plugins use (`hooks/hooks.json`,
 `${CURSOR_PLUGIN_ROOT}`); pstack itself ships none. They are tested by feeding payloads
 to the script, not inside a running Cursor, so the exact payload fields and the
-`loop_limit` behavior are unconfirmed there. The guard is a guardrail, not a sandbox: a
-command that hides `--owner-approved` behind a script or variable is not caught. A
+`loop_limit` behavior are unconfirmed there, including which tool names Cursor reports
+for file edits. The guard is a guardrail, not a sandbox: a command that hides
+`--owner-approved` behind a script or variable is not caught, and a file written through
+the shell is not blocked at the time. The end-of-turn check and the CI gate catch that
+afterwards. A
 cloud agent with no human at a terminal has no way to obtain the freeze approval yet.
+
+### Fuzzing
+
+| Piece | What it does |
+|---|---|
+| `skills/fuzz`, `skills/govern/playbooks/fuzz.md` | Write the properties that must always hold, test logic with generated inputs, drive the app unpredictably through the `verify-<app>` skill, keep only findings that replay, and fix each in its own stage |
+
+This is prose: nothing enforces that a fuzz run was thorough. Not from pstack.
 
 ### Brought in from pstack as-is
 
@@ -145,7 +219,7 @@ and the Benny automation pack.
 
 ## Planned, in order
 
-1. Trial inside Cursor on a real project
+1. Trial inside Cursor on a real project, including `adopt.py` and the CI gate
 2. Owner approval for cloud agents with no human at a terminal
 3. Claude Code adapter
 

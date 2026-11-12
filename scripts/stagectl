@@ -4,13 +4,16 @@
 freeze     freeze an owner-approved contract for this worktree
 run-check  execute frozen checks and record content-bound receipts
 status     read-only readiness report
-close      close the stage; succeeds only when every receipt is current
+close      close the stage; succeeds only when every receipt is current, and
+           writes a receipt to .governance/receipts/ for the pull request
+gate       merge gate: pass only when a committed receipt proves this exact code
 verify     independent verdict: rerun the checks from a different worktree
 revise     replace the contract with an owner-approved successor
 cancel     abandon the stage without completing it
 
 One stage per worktree, so parallel agents in separate worktrees do not collide.
-State lives under <git-common-dir>/governance-v3/. Standard library and Git only;
+State lives under <git-common-dir>/governance-v3/. The receipt is the one record
+that is committed, so CI and reviewers can see what was proven. Standard library and Git only;
 Linux, macOS and Windows.
 Exit codes: 0 ok, 2 invalid invocation, 3 checks failed or stale, 4 owner approval needed.
 """
@@ -40,6 +43,9 @@ _spec = importlib.util.spec_from_loader("verifyctl", _loader)
 verifyctl = importlib.util.module_from_spec(_spec)
 _loader.exec_module(verifyctl)
 
+CONFIG = ".governance/config.json"
+RECEIPTS = ".governance/receipts"
+ALWAYS_EXEMPT = (RECEIPTS + "/**", ".governance/stages/**")
 CONTRACT_FIELDS = {"version", "name", "intent", "review", "inputs", "outputs", "acceptance", "checks"}
 REVIEWS = ("independent", "none")
 VAGUE = re.compile(r"^(todo|tbd|n/?a|none|placeholder|\.+)$", re.IGNORECASE)
@@ -166,6 +172,130 @@ def file_ref(root: Path, value: str) -> dict[str, str]:
     if not path.is_file() or not path.stat().st_size:
         raise Invalid(f"must be an existing nonempty file: {value}")
     return {"path": value, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def glob_regex(pattern: str) -> re.Pattern[str]:
+    """Repository-path glob: `**` crosses directories, `*` and `?` do not."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pattern.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pattern[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pattern[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(pattern[i]), i + 1
+    return re.compile(out + r"\Z")
+
+
+def config(root: Path) -> dict[str, Any]:
+    """Project settings. Absent file: stages are optional and nothing is exempt."""
+    value = read_json(root / CONFIG)
+    if value is None:
+        return {"require_stage": False, "exempt": []}
+    exempt = value.get("exempt", []) if isinstance(value, dict) else None
+    if (not isinstance(value, dict) or type(value.get("require_stage", False)) is not bool
+            or not isinstance(exempt, list) or any(not isinstance(item, str) or not item for item in exempt)):
+        raise Invalid(f"{CONFIG}: expected require_stage (true or false) and exempt (a list of path globs)")
+    return {"require_stage": value.get("require_stage", False), "exempt": exempt}
+
+
+def exempt(root: Path, relative: str, settings: dict[str, Any] | None = None) -> bool:
+    patterns = [*ALWAYS_EXEMPT, *(settings or config(root))["exempt"]]
+    return any(glob_regex(pattern).match(relative) for pattern in patterns)
+
+
+def governed_tree(root: Path, ref: str | None = None) -> str:
+    """Git tree ID of the governed content: the worktree, or a commit when ref is given.
+
+    Built in a throwaway index, so the real index is untouched. Git-ignored files,
+    receipts, contract drafts and configured exempt paths are left out. Git applies its
+    own line-ending rules, so the same content gives the same ID on every platform.
+    """
+    settings = config(root)
+    handle, index = tempfile.mkstemp(prefix="governance-index-")
+    os.close(handle)
+    os.unlink(index)
+    env = {**os.environ, "GIT_INDEX_FILE": index}
+
+    def run(*args: str, data: bytes | None = None) -> bytes:
+        result = subprocess.run(["git", "-C", str(root), *args], input=data, capture_output=True, env=env, check=False)
+        if result.returncode != 0:
+            raise Invalid(f"git {args[0]} failed: {result.stderr.decode(errors='replace').strip()}")
+        return result.stdout
+
+    try:
+        if ref is None:
+            run("add", "-A")
+        else:
+            run("read-tree", ref)
+        names = [name for name in run("ls-files", "-z").split(b"\0") if name]
+        dropped = [name for name in names if exempt(root, os.fsdecode(name), settings)]
+        if dropped:
+            run("update-index", "--force-remove", "-z", "--stdin", data=b"\0".join(dropped) + b"\0")
+        return run("write-tree").decode().strip()
+    finally:
+        for leftover in (index, index + ".lock"):
+            if os.path.exists(leftover):
+                os.unlink(leftover)
+
+
+def receipts(root: Path) -> list[dict[str, Any]]:
+    found = []
+    for path in sorted((root / RECEIPTS).glob("ST-*.json")):
+        value = read_json(path)
+        if isinstance(value, dict) and isinstance(value.get("tree"), str):
+            found.append(value)
+    return found
+
+
+def receipt_markdown(receipt: dict[str, Any]) -> str:
+    lines = [f"### Stage receipt: {receipt['name']}", "", f"**Intent.** {receipt['intent']}", "",
+             f"Stage `{receipt['stage_id']}`, closed {receipt['closed_at']}, proven on tree `{receipt['tree']}`.", "",
+             "| Acceptance | Proven by |", "|---|---|"]
+    for item in receipt["acceptance"]:
+        lines.append(f"| {item['id']}: {item['description']} | {', '.join(item['checks'])} |")
+    lines += ["", "| Check | Command | Result |", "|---|---|---|"]
+    for check in receipt["checks"]:
+        lines.append(f"| {check['id']} | `{' '.join(check['argv'])}` | passed |")
+    verdict = receipt.get("verdict")
+    lines += ["", f"**Independent verdict.** {verdict['outcome']}: {verdict['summary']}" if verdict
+              else "**Independent verdict.** Not required by this contract."]
+    return "\n".join(lines) + "\n"
+
+
+def gate(root: Path, base: str | None, rerun: bool) -> dict[str, Any]:
+    """Pass only when a committed receipt was written for exactly this governed content."""
+    tree = governed_tree(root)
+    if base:
+        fork = git(root, "merge-base", base, "HEAD")
+        if governed_tree(root, fork) == tree:
+            return {"passed": True, "tree": tree, "reason": "no governed file differs from the base"}
+    known = receipts(root)
+    receipt = next((item for item in known if item["tree"] == tree), None)
+    if receipt is None:
+        return {"passed": False, "tree": tree, "problems": [{"code": "no-receipt", "message": (
+            f"no stage receipt proves this code ({len(known)} receipt(s) present, none for tree {tree}). "
+            "Either the change was made outside a stage, or files changed after the stage closed. "
+            "Run the change through a stage and commit the receipt it writes.")}]}
+    result: dict[str, Any] = {"passed": True, "tree": tree, "stage_id": receipt["stage_id"], "receipt": receipt}
+    if rerun:
+        results = []
+        with tempfile.TemporaryDirectory(prefix="governance-gate-") as logs:
+            for check in receipt["checks"]:
+                log = Path(logs) / f"{check['id']}.log"
+                _, status = execute(root, check, log)
+                tail = log.read_text(encoding="utf-8", errors="replace")[-2000:] if status != "passed" else ""
+                results.append({"check_id": check["id"], "status": status, "output": tail})
+        result["results"] = results
+        result["passed"] = all(item["status"] == "passed" for item in results)
+        if not result["passed"]:
+            result["problems"] = [{"code": "check-failed", "message": f"{item['check_id']}: {item['status']} when "
+                                   f"rerun here\n{item['output']}"} for item in results if item["status"] != "passed"]
+    return result
 
 
 def contract_errors(value: Any) -> list[str]:
@@ -489,9 +619,18 @@ def close(root: Path) -> dict[str, Any]:
         directory = state_dir(root) / "stages" / report["stage_id"]
         closure = {key: report[key] for key in ("stage_id", "contract_sha256", "subject", "evidence", "verdict")}
         closure["closed_at"] = now()
+        contract = read_json(directory / "contract.json")["contract"]
+        verdicts = sorted((directory / "verdicts").glob("*/verdict.json"))
+        verdict = read_json(verdicts[-1]) if verdicts and contract["review"] == "independent" else None
+        receipt = {"version": 1, "stage_id": report["stage_id"], "name": contract["name"],
+                   "intent": contract["intent"], "review": contract["review"], "acceptance": contract["acceptance"],
+                   "checks": contract["checks"], "tree": governed_tree(root), "closed_at": closure["closed_at"],
+                   "verdict": {"outcome": verdict["outcome"], "summary": verdict["summary"]} if verdict else None}
         publish(directory / "closure.json", closure)
+        write_json(root / RECEIPTS / f"{report['stage_id']}.json", receipt)
         pointer_path(root).unlink()
-    return {"closed": True, "stage_id": report["stage_id"], "receipt": str(directory / "closure.json")}
+    return {"closed": True, "stage_id": report["stage_id"],
+            "receipt": f"{RECEIPTS}/{report['stage_id']}.json"}
 
 
 def cancel(root: Path, reason: str) -> dict[str, Any]:
@@ -528,6 +667,10 @@ def main() -> int:
     verify_parser.add_argument("--summary", required=True)
     commands.add_parser("close")
     commands.add_parser("cancel").add_argument("--reason", required=True)
+    gate_parser = commands.add_parser("gate")
+    gate_parser.add_argument("--base", help="base branch or commit; a change that touches no governed file passes")
+    gate_parser.add_argument("--rerun", action="store_true", help="also rerun the receipt's checks here")
+    gate_parser.add_argument("--markdown", help="write the matching receipt as Markdown to this file")
     args = parser.parse_args()
     try:
         root = worktree_root(args.repo)
@@ -547,6 +690,12 @@ def main() -> int:
         elif args.command == "close":
             result = close(root)
             code = 0 if result["closed"] else 3
+        elif args.command == "gate":
+            result = gate(root, args.base, args.rerun)
+            code = 0 if result["passed"] else 3
+            if args.markdown and result.get("receipt"):
+                with open(args.markdown, "a", encoding="utf-8") as handle:
+                    handle.write(receipt_markdown(result["receipt"]))
         else:
             result, code = cancel(root, args.reason), 0
     except Gate as exc:
@@ -564,7 +713,8 @@ def main() -> int:
             print(f"{item['check_id']}: {item['status']}")
         summary = {k: v for k, v in result.items() if k in ("frozen", "changed", "revised", "closed", "cancelled",
                                                             "ready", "passed", "stage_id", "receipt", "outcome",
-                                                            "verdict")}
+                                                            "verdict", "tree", "reason")
+                   and not isinstance(v, dict)}
         if summary:
             print(json.dumps(summary))
     return code

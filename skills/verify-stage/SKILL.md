@@ -20,7 +20,7 @@ Work only there. Do not edit tracked files. Anything you create (repro scripts, 
 
 ## 2. Read the contract, not the diff first
 
-Read `stage.json`: the intent, each acceptance item, the checks. Restate the intent with the **in-your-own-words** skill. Judge the change against that intent, not against what the code happens to do.
+Read the stage's contract under `.governance/stages/`: the intent, each acceptance item, the checks. Restate the intent with the **in-your-own-words** skill. Judge the change against that intent, not against what the code happens to do.
 
 ## 3. Prove it yourself
 

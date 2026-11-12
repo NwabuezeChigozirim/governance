@@ -38,6 +38,8 @@ The table sits under a `## Rules` heading in `AGENTS.md` with exactly these colu
 | R-002 | Prefer one PR per slice | docs | | | Judgment call; no size threshold fits every change |
 ```
 
+When the lint level is right and the project's linter has no quick way to express the rule, use the **rulekit** skill: it bans comments, imports across a directory boundary, or a pattern, with a baseline so only new cases fail.
+
 `Level` is `architecture`, `types`, `lint`, `test`, or `docs`. Above `docs`, `Enforced by` cites in backticks the repository file that does the enforcing, and `Proof` is one backticked command that runs that enforcer against a committed example of the mistake, taken from the real past mistake where you can. The proof command must fail. Keep bad examples somewhere the normal build and lint skip, such as `rules/bad/`, so they fail only when the proof targets them. A `docs` rule says in `Notes` why no higher level worked. Then run the checker, locally and in CI:
 
 ```bash
