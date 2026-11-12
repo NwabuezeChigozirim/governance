@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -29,9 +30,19 @@ class AdoptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
-    def tool(self, name: str, *args: str) -> int:
+    def tool(self, name: str, *args: str, env: dict[str, str] | None = None) -> int:
         return subprocess.run([sys.executable, "-B", str(self.repo / "tools" / "governance" / name), *args],
-                              cwd=self.repo, capture_output=True, check=False).returncode
+                              cwd=self.repo, capture_output=True, check=False, env=env).returncode
+
+    @unittest.skipIf(os.name == "nt", "builds a PATH of symlinks")
+    def test_proofs_run_on_a_machine_with_no_command_named_python(self) -> None:
+        self.adopt()
+        bin_dir = self.repo.parent / (self.repo.name + "-bin")
+        bin_dir.mkdir()
+        self.addCleanup(shutil.rmtree, bin_dir, True)
+        (bin_dir / "git").symlink_to(shutil.which("git"))
+        env = {**os.environ, "PATH": str(bin_dir)}
+        self.assertEqual(self.tool("rulectl", "check", "--repo", ".", "--prove", env=env), 0)
 
     def test_adopted_project_passes_its_own_rules_and_proves_them(self) -> None:
         self.adopt()
