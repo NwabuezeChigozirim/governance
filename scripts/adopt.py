@@ -215,7 +215,7 @@ def adopt(repo: Path) -> list[str]:
         rules.append({"id": rule_id, **preset["entry"]})
         rows.append((rule_id, preset["rule"], preset["level"], bad))
         examples[bad] = preset["bad"]
-    fresh = create(governance / "config.json", json.dumps({"version": 1, "require_stage": True, "exempt": []}, indent=2) + "\n", done)
+    fresh = create(governance / "config.json", json.dumps({"version": 1, "require_stage": True, "exempt": [], "protected": []}, indent=2) + "\n", done)
     fresh = create(governance / "rules.json", json.dumps(
         {"version": 1, "exclude": ["tools/governance/**"], "rules": rules}, indent=2) + "\n", done)
     if fresh:

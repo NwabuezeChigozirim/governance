@@ -129,8 +129,13 @@ unusual regex can be misread). `ban-import` resolves relative imports and Python
 modules, not bundler path aliases; use `forbid_specifiers` for those. It is a starter
 kit, not a replacement for the project's own linter and type checker; the `linter`
 kind is how those are brought under the same baseline. A `linter` rule is only as
-strict as the tool's config file, and nothing yet stops an agent from loosening that
-file inside a stage: the diff shows it, the hook does not block it. `max-lines` and
+strict as the tool's config file, so the hook protects those files: in a project with
+`.governance/rules.json`, an agent can edit the rule file, `ruff.toml`, `mypy.ini`,
+`eslint.config.*`, `.eslintrc*`, a root `tsconfig*.json` or the governance workflow
+only when the frozen contract lists that file in `outputs`, and can never edit the
+baseline by hand. `protected` in `.governance/config.json` adds more globs, for
+example `pyproject.toml`. This covers the edit tools, not a file written through the
+shell; the diff and the owner's review catch that. `max-lines` and
 `require-layout` are blunt: they stop a file or folder from getting worse, they do
 not tell you the right design.
 
@@ -240,16 +245,20 @@ This is prose: nothing enforces that a fuzz run was thorough. Not from pstack.
 | Context | `how`, `why`, `recall`, `architect`, `teach`, `sharpen` |
 | Scale | `swarm`, `arena`, `figure-it-out`, `show-me-your-work`, `ketchup`, `bro`, and the autonomous-run, orchestrate, autopilot, babysit and shipping playbooks |
 | Formal verification | `create-formal-verification-skill`, `maintain-formal-verification-skill`, `statechart` |
-| Support | `setup-pstack` (model routing; still writes `pstack-models.mdc`), `unslop`, `technical-writing`, the `govern-agent` delegate |
+| Support | `setup-pstack` (model routing; still writes `pstack-models.mdc`), `unslop`, `technical-writing`, `automate-me`, the `govern-agent` delegate |
 
 These are copied unchanged apart from renaming `poteto-mode` to `govern` and
 `poteto-agent` to `govern-agent`. `tests/test_package.py` fails if any skill names a
 skill the plugin does not ship. Some steps still name skills from Cursor's own
 `cursor-team-kit` plugin (`deslop`, `control-ui`, `control-cli`); the Governance section
 tells the agent what to do in their place. The copied TypeScript helpers
-(`statechart`, `govern/scripts`) need `bun` and their own tests were not run here.
-Not brought in: `make-bot-ui`, `ketchup-video`, `automate-me`, `poteto-help`
-and the Benny automation pack.
+were run once here on Linux: `govern/scripts` with `bun test` (61 pass) and its
+type check, `statechart/scripts` with `npm test` under Node 22 (267 pass, 67 skipped
+because they need `TLA2TOOLS` pointing at `tla2tools.jar`). They are not part of
+this repository's CI. `govern-help` is `poteto-help` rewritten for this plugin: the
+routing table and prompt references are kept, the setup, stage and rule sections
+are new, and links to pstack's guide pages are gone.
+Not brought in: `make-bot-ui`, `ketchup-video` and the Benny automation pack.
 
 ## Planned, in order
 

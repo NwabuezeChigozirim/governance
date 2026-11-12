@@ -8,6 +8,9 @@ pre-tool-use
   are blocked for owner review.
   In a project whose .governance/config.json sets require_stage: file edits are
   blocked until a stage is frozen, and the agent cannot edit that config.
+  In a project with .governance/rules.json: the rule file, the linter and type-checker
+  configs and the governance workflow can be edited only when the frozen contract
+  lists the file in its outputs, and the baseline cannot be edited by hand.
 stop
   While a stage is active and not ready to close, send the agent back once with the
   list of what is still unproven. In a require_stage project with no active stage,
@@ -77,6 +80,15 @@ def unproven_changes(stagectl, root: Path) -> list[str]:
     return [] if any(item["tree"] == tree for item in stagectl.receipts(root)) else changed
 
 
+def approved_outputs(stagectl, root: Path) -> set[str]:
+    """Outputs of the frozen contract: the files the owner agreed this stage may produce."""
+    try:
+        outputs = stagectl.active(root)[2]["contract"]["outputs"]
+    except Exception:
+        return set()
+    return {relative for relative in (inside(root, value) for value in outputs) if relative}
+
+
 def deny(reason: str) -> dict[str, str]:
     return {"permission": "deny", "user_message": reason, "agent_message": reason}
 
@@ -102,6 +114,13 @@ def pre_tool_use(payload: dict) -> dict[str, str]:
         if relative.startswith(stagectl.RECEIPTS + "/"):
             return deny("Governance: a stage receipt is written only by `stagectl close`. Do not create or edit one.")
         settings = stagectl.config(root)
+        if relative == stagectl.BASELINE and (root / stagectl.RULES).is_file():
+            return deny("Governance: the baseline is written only by `rulekit baseline`, and it only shrinks. "
+                        "Fix the violation instead.")
+        if stagectl.protected(root, relative, settings) and relative not in approved_outputs(stagectl, root):
+            return deny(f"Governance: {relative} sets how strict the checks are. Fix the code, not the check. If the "
+                        "task really is to change this file, list it in the contract's outputs so the owner "
+                        "sees it when freezing (or revising) the stage, then retry.")
         if not settings["require_stage"]:
             return {}
         if relative == stagectl.CONFIG:

@@ -39,7 +39,7 @@ Write the contract to `.governance/stages/<short-name>.json`. That directory is 
 - `intent` is your restatement from step 1.
 - `review` is `independent` for any change that ships behavior: a second agent must verify it from its own checkout before the stage can close. Use `none` only for changes with no behavior to drive, such as docs or a rename, and say why when you ask for approval.
 - Each acceptance item states an outcome a user could observe, and names the checks that prove it.
-- `inputs` are the files whose change would invalidate this agreement (specs, the wave brief). `outputs` must exist and be nonempty at close. Either list may be empty.
+- `inputs` are the files whose change would invalidate this agreement (specs, the wave brief). `outputs` must exist and be nonempty at close. A file that sets how strict the checks are (`.governance/rules.json`, a linter or type-checker config, the governance workflow) can be edited only when it is listed here, so the owner sees it before freezing. Either list may be empty.
 - A check is an argv array, not a shell string. It must not edit the code it checks.
 - Any stage that changes behavior a user can see needs a `verifyctl check ... --fresh` check against the project's `verify-<app>` skill. `--fresh` fails when the code changed after the evidence was recorded. If the project has no such skill, run the **create-verification-skill** skill first.
 
