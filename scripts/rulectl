@@ -28,6 +28,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -93,10 +94,17 @@ def proof_argv(value: str) -> list[str] | None:
     return argv or None
 
 
+def launchable(argv: list[str]) -> list[str]:
+    """`python` or `python3` on a machine that lacks that name runs under this interpreter."""
+    if argv and argv[0] in ("python", "python3") and shutil.which(argv[0]) is None:
+        return [sys.executable, *argv[1:]]
+    return argv
+
+
 def prove(repo: Path, argv: list[str]) -> str | None:
     """Run a proof. Return None when it fails as required, otherwise why it is not a proof."""
     try:
-        result = subprocess.run(argv, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True,
+        result = subprocess.run(launchable(argv), cwd=repo, stdin=subprocess.DEVNULL, capture_output=True,
                                 timeout=PROOF_TIMEOUT, check=False)
     except FileNotFoundError:
         return f"proof command not found: {argv[0]}"

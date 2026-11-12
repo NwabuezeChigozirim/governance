@@ -296,7 +296,7 @@ def relative(repo: Path, raw: str) -> str | None:
 
 def run_linter(repo: Path, rule: dict[str, Any], paths: list[str]) -> dict[str, list[tuple[int, str]]]:
     argv = [*rule["argv"], *(paths or rule.get("target", []))]
-    program = sys.executable if argv[0] in ("python", "python3") else shutil.which(argv[0])
+    program = shutil.which(argv[0]) or (sys.executable if argv[0] in ("python", "python3") else None)
     if not program:
         raise Missing(f"{rule['id']}: {argv[0]} is not installed. {rule.get('install', '')}".strip())
     try:
