@@ -138,6 +138,73 @@ class RulekitTests(unittest.TestCase):
         self.rules({"id": "R-001", "kind": "ban-pattern", "include": ["**"], "pattern": "x"})
         self.assertEqual(self.kit("check", "--rule", "R-999")[0], 2)
 
+    def test_file_length_limit_and_a_long_file_may_not_grow(self) -> None:
+        self.rules({"id": "R-001", "kind": "max-lines", "max": 3, "include": ["src/**"]})
+        self.write("src/ok.py", "a = 1\n" * 3)
+        self.write("src/long.py", "a = 1\n" * 5)
+        self.assertEqual(self.lines(), [("src/long.py", 4)])
+        self.assertEqual(self.kit("baseline")[0], 0)
+        self.assertEqual(self.kit("check")[0], 0)
+        self.write("src/long.py", "a = 1\n" * 6)
+        self.assertEqual(self.kit("check")[0], 3)
+        self.write("src/long.py", "a = 1\n" * 4)
+        self.assertEqual(self.kit("check")[0], 0)
+
+    def test_files_must_sit_inside_the_allowed_layout(self) -> None:
+        self.rules({"id": "R-001", "kind": "require-layout", "include": ["src/**"],
+                    "paths": ["src/features/*/**", "src/shared/**", "src/main.ts"]})
+        for name in ("src/features/cart/view.ts", "src/shared/x.ts", "src/main.ts", "src/helpers.ts", "docs/a.ts"):
+            self.write(name, "export {};\n")
+        self.assertEqual(self.lines(), [("src/helpers.ts", 1)])
+        self.write(".governance/bad/R-001.ts", "export {};\n")
+        self.assertEqual(self.kit("check", "--as", "src/stray/x.ts", ".governance/bad/R-001.ts")[0], 3)
+
+    def linter(self, **extra: object) -> None:
+        self.write("lint.py", "import sys\nfor name in sys.argv[1:] or ['a.py', 'b.py', 'gone.py', 'vendor/c.py']:\n"
+                              "    print(f'{name}:2:1: E1 bad thing.')\n    print(f'{name}(3,1): error T2 worse')\n"
+                              "print('Found errors')\nsys.exit(1)\n")
+        self.rules({"id": "R-001", "kind": "linter", "argv": ["python", "lint.py"], "include": ["**/*.py"], **extra},
+                   exclude=["vendor/**", "lint.py"])
+        for name in ("a.py", "b.py", "vendor/c.py"):
+            self.write(name, "x = 1\n")
+
+    def test_linter_findings_obey_include_exclude_and_the_baseline(self) -> None:
+        self.linter()
+        self.assertEqual(self.lines(), [("a.py", 2), ("a.py", 3), ("b.py", 2), ("b.py", 3)])
+        self.assertIn("E1 bad thing. Do the right", self.kit("check")[1]["violations"][0]["message"])
+        self.assertEqual(self.kit("baseline")[1]["violations_recorded"], 4)
+        self.assertEqual(self.kit("check")[0], 0)
+        self.assertEqual(len(self.lines("--no-baseline")), 4)
+        self.assertEqual(self.lines("--rule", "R-001", "vendor/c.py"), [("vendor/c.py", 2), ("vendor/c.py", 3)])
+
+    def test_eslint_json_findings_are_read(self) -> None:
+        self.write("a.js", "x\n")
+        report = [{"filePath": str(self.repo / "a.js"), "messages": [{"line": 4, "ruleId": "eqeqeq", "message": "Use ==="}]}]
+        self.write("lint.py", f"import sys\nprint({json.dumps(json.dumps(report))})\nsys.exit(1)\n")
+        self.rules({"id": "R-001", "kind": "linter", "format": "eslint-json", "argv": ["python", "lint.py"],
+                    "include": ["**/*.js"]})
+        self.assertEqual(self.lines(), [("a.js", 4)])
+
+    def test_a_missing_or_crashing_linter_is_not_a_pass(self) -> None:
+        self.rules({"id": "R-001", "kind": "linter", "argv": ["no-such-linter-here"], "include": ["**"]})
+        self.assertEqual(self.kit("check")[0], 127)
+        self.write("lint.py", "import sys\nsys.exit('config broken')\n")
+        self.rules({"id": "R-001", "kind": "linter", "argv": ["python", "lint.py"], "include": ["**"]})
+        code, out = self.kit("check")
+        self.assertEqual(code, 2)
+        self.assertIn("config broken", out["error"])
+
+    def test_survey_reports_long_files_excuses_suppressions_and_baseline(self) -> None:
+        self.rules({"id": "R-001", "kind": "ban-comments", "include": ["**/*.ts"]})
+        self.write("src/big.ts", "const a = 1;\n" * 9 + "// HACK: for now\nconst b = c as any;\n")
+        self.write("src/small.ts", "const a = 1;\n")
+        self.kit("baseline")
+        report = self.kit("survey")[1]
+        self.assertEqual(report["longest_files"][0], {"path": "src/big.ts", "count": 11})
+        self.assertEqual(report["excuses"]["total"], 1)
+        self.assertEqual(report["suppressions"]["by_kind"], {"as any": 1})
+        self.assertEqual(report["baseline_left"]["R-001"]["total"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,10 +31,24 @@ python scripts/adopt.py --repo path/to/project
 |---|---|
 | `tools/governance/` | `stagectl`, `verifyctl`, `rulectl`, `rulekit`, so CI and the terminal can run them |
 | `.governance/config.json` | `require_stage: true`: the hook blocks an agent's file edits until a stage is frozen. `exempt` lists path globs that need no stage |
-| `.governance/rules.json`, `bad/R-001.*`, `baseline.json` | Starter rule R-001, no comments in source files, with its bad example and a baseline of today's comments |
-| `AGENTS.md` | A `## Rules` table listing R-001 |
+| `.governance/rules.json`, `bad/R-*.*`, `baseline.json` | Starter rules, each with a bad example, and a baseline of today's violations. R-001: no comments in source files. R-002: no source file over 400 lines. Then the strict preset for the language |
+| `ruff.toml` or `eslint.config.mjs` | Strict linter settings, only when the project has none |
+| `AGENTS.md` | A `## Rules` table listing the starter rules |
 | `.github/workflows/governance.yml` | On every pull request: the rules hold, every rule's proof fails as it must, and a stage receipt matches the exact code |
 | `.gitignore` | `.verify/` |
+
+The strict preset is borrowed judgement: the standard tools already encode what
+experienced engineers reject, so the owner does not have to.
+
+| Project | Rules added | Needs installed |
+|---|---|---|
+| Python | `ruff` with a wide rule set (bugs, complexity limit 10, naming, unused arguments, dead code) and `mypy --strict` | `pip install ruff mypy` |
+| TypeScript or JavaScript with a `package.json` | ESLint with `typescript-eslint` strict, complexity limit 10, depth 4, 4 parameters; plus `tsc --strict --noUncheckedIndexedAccess` when there is a `tsconfig.json` | `npm install --save-dev eslint @eslint/js typescript-eslint typescript` |
+| Other languages | R-001 and R-002 only | Nothing |
+
+If a tool is missing, adoption says `NOT DONE` and names the command to run; the
+baseline is recorded once the tools are there. An existing linter config is used as it
+is, not replaced.
 
 It never overwrites a file that exists, apart from refreshing `tools/governance/`.
 Commit the result to the main branch directly (its own pull request has no receipt
@@ -94,13 +108,15 @@ form of the mistake. `--prove` executes commands from the instruction file.
 
 | Piece | What it does |
 |---|---|
-| `scripts/rulekit` | A dependency-free linter driven by `.governance/rules.json`. Three kinds of rule: `ban-comments`, `ban-import` (one directory may not import from another), `ban-pattern` (a banned API or construct). Every failure prints the rule's message, which states the fix |
+| `scripts/rulekit` | A dependency-free linter driven by `.governance/rules.json`. Six kinds of rule: `ban-comments`, `ban-import` (one directory may not import from another), `ban-pattern` (a banned API or construct), `max-lines` (a file-length cap; a file already over it may shrink but not grow), `require-layout` (source files may live only in the listed folders), and `linter` (runs the project's own linter or type checker and holds its findings to the same baseline). Every failure prints the rule's message, which states the fix |
 | `skills/rulekit` | How an agent adds a rule: config entry, committed bad example, proof command, table row |
 
 ```bash
 python tools/governance/rulekit check
 python tools/governance/rulekit check --rule R-002 --as src/renderer/x.ts .governance/bad/R-002.ts
 python tools/governance/rulekit baseline
+python tools/governance/rulekit check --no-baseline
+python tools/governance/rulekit survey
 ```
 
 The baseline records how many violations each file has today, so a rule can be switched
@@ -111,7 +127,12 @@ Limits: `ban-comments` covers Python (exact, via the tokenizer) and C-style lang
 (a scanner that skips strings, templates and most regular-expression literals; an
 unusual regex can be misread). `ban-import` resolves relative imports and Python
 modules, not bundler path aliases; use `forbid_specifiers` for those. It is a starter
-kit, not a replacement for the project's own linter and type checker.
+kit, not a replacement for the project's own linter and type checker; the `linter`
+kind is how those are brought under the same baseline. A `linter` rule is only as
+strict as the tool's config file, and nothing yet stops an agent from loosening that
+file inside a stage: the diff shows it, the hook does not block it. `max-lines` and
+`require-layout` are blunt: they stop a file or folder from getting worse, they do
+not tell you the right design.
 
 ### Merge gate: the receipt
 
@@ -189,6 +210,19 @@ for file edits. The guard is a guardrail, not a sandbox: a command that hides
 the shell is not blocked at the time. The end-of-turn check and the CI gate catch that
 afterwards. A
 cloud agent with no human at a terminal has no way to obtain the freeze approval yet.
+
+### Gardening and cleanup
+
+| Piece | What it does |
+|---|---|
+| `rulekit survey` | Facts about where the code is weakest: longest files, fullest folders, excuse comments, silenced checks, and how much of each rule's baseline is left |
+| `skills/garden` | Reads the survey, recent commits and past chats, groups repeated mistakes into habits, appends them to `.governance/findings.md`, and proposes one rule per habit for the owner to approve |
+| `skills/govern/playbooks/cleanup.md` | Removes one rule's old violations in reviewable batches, each in its own stage, with behavior unchanged, and shrinks the baseline |
+
+The survey is deterministic. The garden skill and the cleanup playbook are prose:
+nothing enforces that they are run. Run `/garden` every few days, or on a schedule.
+Not from pstack; the idea is from Lauren Tan's talks (the gardener role, and logging
+findings before fixing them).
 
 ### Fuzzing
 

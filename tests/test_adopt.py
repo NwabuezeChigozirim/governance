@@ -58,6 +58,39 @@ class AdoptTests(unittest.TestCase):
         self.assertEqual(guide.count("## Rules"), 1)
         self.assertIn("Be careful.", guide)
 
+    def test_file_length_rule_is_installed_and_proven(self) -> None:
+        self.adopt()
+        self.assertEqual(self.tool("rulekit", "check", "--rule", "R-002", ".governance/bad/R-002.ts"), 3)
+        (self.repo / "src" / "huge.ts").write_text("export const a = 1;\n" * 401, encoding="utf-8")
+        self.assertEqual(self.tool("rulekit", "check"), 3)
+
+    def test_python_project_gets_the_strict_linter_and_type_checker(self) -> None:
+        (self.repo / "src" / "app.ts").unlink()
+        (self.repo / "src" / "app.py").write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
+        out = self.adopt()
+        rules = json.loads((self.repo / ".governance/rules.json").read_text())["rules"]
+        self.assertEqual([rule["argv"][0] for rule in rules if rule["kind"] == "linter"], ["ruff", "mypy"])
+        self.assertIn("select", (self.repo / "ruff.toml").read_text())
+        self.assertIn("pip install ruff mypy", (self.repo / ".github/workflows/governance.yml").read_text())
+        self.assertIn("R-004", (self.repo / "AGENTS.md").read_text())
+        if shutil.which("ruff") and shutil.which("mypy"):
+            self.assertEqual(self.tool("rulekit", "check"), 0)
+            self.assertEqual(self.tool("rulectl", "check", "--repo", ".", "--prove"), 0)
+            (self.repo / "src" / "new.py").write_text("def more(x):\n    return x\n", encoding="utf-8")
+            self.assertEqual(self.tool("rulekit", "check"), 3)
+        else:
+            self.assertIn("NOT DONE", out)
+            self.assertEqual(self.tool("rulekit", "check"), 127)
+
+    def test_node_project_gets_eslint_and_the_strict_type_check(self) -> None:
+        (self.repo / "package.json").write_text("{}", encoding="utf-8")
+        (self.repo / "tsconfig.json").write_text("{}", encoding="utf-8")
+        self.assertIn("NOT DONE", self.adopt())
+        rules = json.loads((self.repo / ".governance/rules.json").read_text())["rules"]
+        self.assertEqual([rule["argv"][2] for rule in rules if rule["kind"] == "linter"], ["tsc", "eslint"])
+        self.assertIn("strict", (self.repo / "eslint.config.mjs").read_text())
+        self.assertIn("npm ci", (self.repo / ".github/workflows/governance.yml").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

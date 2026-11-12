@@ -1,6 +1,6 @@
 ---
 name: rulekit
-description: "Turn a correction into an enforced rule in minutes with the built-in enforcers: ban comments, ban imports across a directory boundary, ban a pattern or API. Use when the correct skill reaches the lint level and the project has no linter rule for the mistake, or to add or tighten a rule in .governance/rules.json."
+description: "Turn a correction into an enforced rule in minutes with the built-in enforcers: ban comments, ban imports across a directory boundary, ban a pattern or API, cap file length, fix the folder layout, or hold the project's own linter to a baseline. Use when the correct skill reaches the lint level and the project has no linter rule for the mistake, or to add or tighten a rule in .governance/rules.json."
 ---
 
 # Rulekit
@@ -11,13 +11,16 @@ In an adopted project the tools are at `tools/governance/`. Run them as `python 
 
 ## Add a rule
 
-1. **State the mistake as something a machine can see.** One of three kinds:
+1. **State the mistake as something a machine can see.** One of six kinds:
 
    | Kind | Catches | Needs |
    |---|---|---|
    | `ban-comments` | Any comment in the matched files | `allow`: patterns for tool directives worth keeping |
    | `ban-import` | A file under `include` importing from a directory in `forbid`, or a specifier matching `forbid_specifiers` | The two directories of the boundary |
    | `ban-pattern` | A line matching `pattern` in the matched files | A pattern narrow enough not to hit correct code |
+   | `max-lines` | A matched file longer than `max` lines | The limit. A file already over it may shrink but not grow |
+   | `require-layout` | A matched file at a path matching none of the `paths` globs | The folders code is allowed to live in, for example `src/features/*/**` |
+   | `linter` | Whatever the project's linter or type checker reports | `argv`, the command; `target`, what it checks when no file is named; `format`: `eslint-json` for ESLint's JSON output |
 
    If the mistake fits none of these, go back to the **correct** skill's ladder: a type, a test, or the project's linter.
 
@@ -38,7 +41,7 @@ In an adopted project the tools are at `tools/governance/`. Run them as `python 
    python tools/governance/rulekit check --rule R-002 --as src/renderer/example.ts .governance/bad/R-002.ts
    ```
 
-   `--as` is needed only for `ban-import`, where the file's location is part of the rule.
+   `--as` is needed for `ban-import` and `require-layout`, where the file's location is part of the rule. It does not apply to a `linter` rule.
 
 5. **Add the row to the `## Rules` table in `AGENTS.md`**, with that command as its Proof and `.governance/rules.json` as Enforced by. Then both of these must pass:
 
@@ -53,4 +56,5 @@ In an adopted project the tools are at `tools/governance/`. Run them as `python 
 
 - The baseline only shrinks. If `baseline` refuses because a count would grow, fix the new violation. Growing it takes the owner running `rulekit baseline --owner-approved`; the hook blocks you from running that.
 - Never widen `allow`, narrow `include`, add to `exclude`, or loosen a `pattern` to make a failure go away. A rule change is its own stage, with the owner approving the contract.
+- A `linter` rule is only as strict as the tool's config file (`ruff.toml`, `eslint.config.mjs`, `tsconfig.json`). Never relax that file, add a suppression comment, or cast a type away to get past a finding. Exit 127 means the tool is not installed: install it, do not remove the rule.
 - `ban-comments` understands Python and C-style languages. `ban-import` resolves relative imports and Python modules; path aliases need `forbid_specifiers`. Say so when a rule depends on something it cannot see.
