@@ -59,7 +59,7 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn("poteto-mode", path.read_text(encoding="utf-8"), path)
 
     def test_scripts_named_by_skills_exist(self) -> None:
-        for name in ("stagectl", "verifyctl", "rulectl"):
+        for name in ("stagectl", "verifyctl", "rulectl", "rulekit", "adopt.py", "install.py"):
             self.assertTrue((PACKAGE / "scripts" / name).is_file())
 
 

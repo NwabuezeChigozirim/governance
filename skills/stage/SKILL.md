@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 A stage is one reviewable unit of work in one worktree. The owner approves its intent and checks once, at the start. After that nothing waits on the owner: the stage closes itself when every check has passed on the final code.
 
-`stagectl` is at `../../scripts/stagectl` from this file. Run it as `python3 <path>/stagectl --repo . <command>`.
+`stagectl` is at `../../scripts/stagectl` from this file, and at `tools/governance/stagectl` in a project that ran the plugin's `adopt.py`. Run it as `python3 <path>/stagectl --repo . <command>`.
 
 ## 1. Restate the intent
 
@@ -16,7 +16,7 @@ Apply the **in-your-own-words** skill: say what the owner wants, the problem it 
 
 ## 2. Write the contract
 
-Write `stage.json` in the repository:
+Write the contract to `.governance/stages/<short-name>.json`. That directory is for contract drafts: it can be edited before a stage exists, and it is not part of the code a receipt covers.
 
 ```json
 {
@@ -48,7 +48,7 @@ Write `stage.json` in the repository:
 Show the owner the intent, the acceptance list and the check commands. This is the one approval in the stage. Ask them to run this themselves:
 
 ```bash
-stagectl --repo . freeze --contract stage.json --owner-approved
+stagectl --repo . freeze --contract .governance/stages/<short-name>.json --owner-approved
 ```
 
 You do not run it. Only the owner records approval, and the plugin's hook blocks an agent that tries. The same holds for `revise`.
@@ -76,11 +76,15 @@ You cannot record the verdict yourself: `stagectl verify` refuses the worktree t
 stagectl --repo . close
 ```
 
-It succeeds only when every check's latest attempt passed on the current code, the frozen inputs are unchanged, the outputs exist, and an independent stage has a passing verdict on that same code. It needs no owner flag. Report the stage ID and the receipt path.
+It succeeds only when every check's latest attempt passed on the current code, the frozen inputs are unchanged, the outputs exist, and an independent stage has a passing verdict on that same code. It needs no owner flag.
+
+Closing writes a receipt to `.governance/receipts/<stage-id>.json`: the intent, the acceptance items, the checks, the verdict, and an ID for the exact code that was proven. Commit the receipt and change nothing else. The project's CI runs `stagectl gate`, which passes a pull request only when a committed receipt matches its code, so an edit after close (even a formatting fix) fails the gate until a new stage proves it. You never write or edit a receipt yourself; the hook blocks it.
+
+Report the stage ID and the receipt path.
 
 ## When the agreement changes
 
-- A frozen input changed, or the intent, acceptance or checks must change: update `stage.json`, get the owner's approval for the new version, then `stagectl revise --contract stage.json --owner-approved --reason "..."`. All checks start over.
+- A frozen input changed, or the intent, acceptance or checks must change: update the contract file, get the owner's approval for the new version, then `stagectl revise --contract .governance/stages/<short-name>.json --owner-approved --reason "..."`. All checks start over.
 - The work is abandoned: `stagectl cancel --reason "..."`. Cancellation is never completion.
 
 Exit codes: 0 ok, 2 invalid invocation or no active stage, 3 checks failed or stale, 4 owner approval needed.

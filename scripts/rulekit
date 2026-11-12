@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Ready-made enforcers for a project's rules, configured in .governance/rules.json.
+
+check     fail when a file breaks a rule beyond the recorded baseline
+baseline  record today's violations so only new ones fail; it can only shrink
+
+Three kinds of rule:
+  ban-comments  no comments in the matched files (Python and C-style languages)
+  ban-import    files under `include` must not import from the `forbid` directories,
+                or use a specifier matching `forbid_specifiers`
+  ban-pattern   no line in the matched files matches `pattern`
+
+{"version": 1, "exclude": ["dist/**"], "rules": [
+  {"id": "R-001", "kind": "ban-comments", "include": ["src/**/*.ts"], "allow": ["^eslint-"],
+   "message": "Delete the comment. Put the reason in a name, a type or a test."},
+  {"id": "R-002", "kind": "ban-import", "include": ["src/renderer/**"], "forbid": ["src/main"],
+   "message": "Renderer code calls main through the IPC client in src/shared/ipc."},
+  {"id": "R-003", "kind": "ban-pattern", "include": ["src/**/*.tsx"], "pattern": "\\buseEffect\\(",
+   "message": "Use a data hook from src/data instead of useEffect."}]}
+
+Every message says what to do instead, because the agent reads it and acts on it.
+Paths given on the command line are checked whatever `include`, `exclude` and the
+baseline say; that is how a rule's proof runs it against a committed bad example.
+`--as PATH` checks one such file as if it lived at PATH.
+
+Standard library only. Exit codes: 0 ok, 2 invalid invocation, 3 violations found.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+from pathlib import Path, PurePosixPath
+import posixpath
+import re
+import subprocess
+import sys
+import tokenize
+from typing import Any
+
+RULES = ".governance/rules.json"
+BASELINE = ".governance/baseline.json"
+KINDS = ("ban-comments", "ban-import", "ban-pattern")
+C_STYLE = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts", ".java", ".kt", ".go", ".rs", ".c", ".h",
+           ".cc", ".cpp", ".hpp", ".cs", ".swift", ".dart", ".scala"}
+SCRIPT = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"}
+ALWAYS_EXCLUDED = (".governance/**", "node_modules/**", "**/node_modules/**")
+JS_IMPORT = re.compile(r"""(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)(['"])([^'"\n]+)\1""")
+PY_IMPORT = re.compile(r"^\s*(?:from\s+([.\w]+)\s+import\b|import\s+([\w.]+(?:\s*,\s*[\w.]+)*))")
+REGEX_AFTER = set("(,=:[!&|?{};+-*%<>~^")
+
+
+class Invalid(Exception):
+    pass
+
+
+def glob_regex(pattern: str) -> re.Pattern[str]:
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pattern.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pattern[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pattern[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(pattern[i]), i + 1
+    return re.compile(out + r"\Z")
+
+
+def matches(patterns: list[str] | tuple[str, ...], path: str) -> bool:
+    return any(glob_regex(pattern).match(path) for pattern in patterns)
+
+
+def load_rules(repo: Path) -> dict[str, Any]:
+    path = repo / RULES
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise Invalid(f"{RULES} not found") from None
+    except json.JSONDecodeError as exc:
+        raise Invalid(f"{RULES}: not valid JSON ({exc})") from exc
+    if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("rules"), list):
+        raise Invalid(f"{RULES}: expected version 1 and a rules list")
+    seen: set[str] = set()
+    for rule in value["rules"]:
+        name = rule.get("id") if isinstance(rule, dict) else None
+        if not isinstance(name, str) or not re.fullmatch(r"R-\d{3,}", name) or name in seen:
+            raise Invalid(f"{RULES}: every rule needs a unique id such as R-001")
+        seen.add(name)
+        if rule.get("kind") not in KINDS:
+            raise Invalid(f"{name}: kind must be one of {', '.join(KINDS)}")
+        if not isinstance(rule.get("message"), str) or len(rule["message"].strip()) < 12:
+            raise Invalid(f"{name}: message must tell the agent what to do instead")
+        if not strings(rule.get("include")) or not rule["include"]:
+            raise Invalid(f"{name}: include must be a nonempty list of path globs")
+        for key in ("allow", "forbid", "forbid_specifiers", "python_roots"):
+            if key in rule and not strings(rule[key]):
+                raise Invalid(f"{name}: {key} must be a list of strings")
+        if rule["kind"] == "ban-import" and not (rule.get("forbid") or rule.get("forbid_specifiers")):
+            raise Invalid(f"{name}: a ban-import rule needs forbid or forbid_specifiers")
+        if rule["kind"] == "ban-pattern" and not isinstance(rule.get("pattern"), str):
+            raise Invalid(f"{name}: a ban-pattern rule needs a pattern")
+        try:
+            for expression in [rule.get("pattern", ""), *rule.get("allow", []), *rule.get("forbid_specifiers", [])]:
+                re.compile(expression)
+        except re.error as exc:
+            raise Invalid(f"{name}: invalid regular expression ({exc})") from exc
+    if "exclude" in value and not strings(value["exclude"]):
+        raise Invalid(f"{RULES}: exclude must be a list of path globs")
+    return value
+
+
+def strings(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) and item for item in value)
+
+
+def repository_files(repo: Path) -> list[str]:
+    result = subprocess.run(["git", "-C", str(repo), "ls-files", "-co", "--exclude-standard", "-z"],
+                            capture_output=True, check=False)
+    if result.returncode == 0:
+        names = [name.decode("utf-8", "surrogateescape") for name in result.stdout.split(b"\0") if name]
+    else:
+        names = [path.relative_to(repo).as_posix() for path in repo.rglob("*")
+                 if path.is_file() and ".git" not in path.relative_to(repo).parts]
+    return sorted(name for name in names if (repo / name).is_file())
+
+
+def python_comments(text: str) -> list[tuple[int, str]]:
+    found = []
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type == tokenize.COMMENT and not (token.start[0] == 1 and token.string.startswith("#!")):
+                found.append((token.start[0], token.string[1:].strip()))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        pass
+    return found
+
+
+def c_style_comments(text: str, script: bool) -> list[tuple[int, str]]:
+    """Comments outside string, template and (for JavaScript) regular-expression literals."""
+    found: list[tuple[int, str]] = []
+    i, line, last = 0, 1, ""
+    size = len(text)
+    while i < size:
+        char = text[i]
+        if char == "\n":
+            line += 1
+            i += 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            end = size if end == -1 else end
+            if not (line == 1 and text.startswith("#!")):
+                found.append((line, text[i + 2:end].strip()))
+            i = end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            end = size if end == -1 else end + 2
+            found.append((line, text[i + 2:end - 2].strip()))
+            line += text.count("\n", i, end)
+            i = end
+        elif char in "\"'`":
+            j = i + 1
+            while j < size and text[j] != char:
+                if text[j] == "\\":
+                    j += 1
+                elif text[j] == "\n" and char != "`":
+                    break
+                j += 1
+            line += text.count("\n", i, min(j, size))
+            i, last = (j if j < size and text[j] == "\n" else j + 1), char
+        elif char == "/" and script and (not last or last in REGEX_AFTER):
+            j, in_class = i + 1, False
+            while j < size and text[j] != "\n" and (in_class or text[j] != "/"):
+                if text[j] == "\\":
+                    j += 1
+                elif text[j] == "[":
+                    in_class = True
+                elif text[j] == "]":
+                    in_class = False
+                j += 1
+            i, last = (j if j < size and text[j] == "\n" else j + 1), "/"
+        else:
+            if not char.isspace():
+                last = char
+            i += 1
+    return found
+
+
+def imports(path: str, text: str, roots: list[str]) -> list[tuple[int, str, list[str]]]:
+    """Each import as (line, specifier, repository paths it may resolve to)."""
+    found = []
+    folder = posixpath.dirname(path)
+    python = path.endswith(".py")
+    for number, line in enumerate(text.splitlines(), 1):
+        if python:
+            match = PY_IMPORT.match(line)
+            if not match:
+                continue
+            modules = [match.group(1)] if match.group(1) else [m.strip() for m in match.group(2).split(",")]
+            for module in modules:
+                dots = len(module) - len(module.lstrip("."))
+                tail = module.lstrip(".").replace(".", "/")
+                if dots:
+                    base = posixpath.normpath(posixpath.join(folder, *[".."] * (dots - 1)))
+                    candidates = [posixpath.normpath(posixpath.join(base, tail))]
+                else:
+                    candidates = [posixpath.normpath(posixpath.join(root, tail)) for root in roots]
+                found.append((number, module, candidates))
+        else:
+            for match in JS_IMPORT.finditer(line):
+                specifier = match.group(2)
+                resolved = [posixpath.normpath(posixpath.join(folder, specifier))] if specifier.startswith(".") else []
+                found.append((number, specifier, resolved))
+    return found
+
+
+def violations(rule: dict[str, Any], path: str, text: str) -> list[tuple[int, str]]:
+    suffix = PurePosixPath(path).suffix.lower()
+    if rule["kind"] == "ban-comments":
+        if suffix == ".py":
+            comments = python_comments(text)
+        elif suffix in C_STYLE:
+            comments = c_style_comments(text, suffix in SCRIPT)
+        else:
+            return []
+        allowed = [re.compile(item) for item in rule.get("allow", [])]
+        return [(line, f"comment: {body[:60]}") for line, body in comments
+                if not any(pattern.search(body) for pattern in allowed)]
+    if rule["kind"] == "ban-pattern":
+        pattern = re.compile(rule["pattern"])
+        return [(number, f"matches {rule['pattern']}") for number, line in enumerate(text.splitlines(), 1)
+                if pattern.search(line)]
+    forbidden = [item.strip("/") for item in rule.get("forbid", [])]
+    specifiers = [re.compile(item) for item in rule.get("forbid_specifiers", [])]
+    found = []
+    for number, specifier, candidates in imports(path, text, rule.get("python_roots", ["", "src"])):
+        hit = any(candidate == directory or candidate.startswith(directory + "/")
+                  for candidate in candidates for directory in forbidden)
+        if hit or any(pattern.search(specifier) for pattern in specifiers):
+            found.append((number, f"imports {specifier}"))
+    return found
+
+
+def scan(repo: Path, config: dict[str, Any], only: str | None, paths: list[str], alias: str | None):
+    """Yield (rule, path, [(line, detail)]) for every file with violations."""
+    rules = [rule for rule in config["rules"] if only in (None, rule["id"])]
+    if only and not rules:
+        raise Invalid(f"unknown rule: {only}")
+    if paths:
+        targets = []
+        for value in paths:
+            path = Path(value) if Path(value).is_absolute() else repo / value
+            if not path.is_file():
+                raise Invalid(f"file not found: {value}")
+            try:
+                targets.append((path, alias or path.resolve().relative_to(repo).as_posix()))
+            except ValueError:
+                raise Invalid(f"file is outside the repository: {value}") from None
+    else:
+        excluded = (*ALWAYS_EXCLUDED, *config.get("exclude", []))
+        targets = [(repo / name, name) for name in repository_files(repo) if not matches(excluded, name)]
+    for path, name in targets:
+        applicable = [rule for rule in rules if paths or matches(rule["include"], name)]
+        if not applicable:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for rule in applicable:
+            found = violations(rule, name, text)
+            if found:
+                yield rule, name, found
+
+
+def read_baseline(repo: Path) -> dict[str, dict[str, int]]:
+    try:
+        value = json.loads((repo / BASELINE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise Invalid(f"{BASELINE}: not valid JSON ({exc})") from exc
+    return value.get("counts", {}) if isinstance(value, dict) else {}
+
+
+def check(repo: Path, only: str | None, paths: list[str], alias: str | None) -> dict[str, Any]:
+    config = load_rules(repo)
+    allowed = {} if paths else read_baseline(repo)
+    problems, tolerated = [], 0
+    for rule, name, found in scan(repo, config, only, paths, alias):
+        limit = allowed.get(rule["id"], {}).get(name, 0)
+        if len(found) <= limit:
+            tolerated += len(found)
+            continue
+        note = f" (this file has {len(found)}; the baseline allows {limit})" if limit else ""
+        for line, detail in found:
+            problems.append({"rule": rule["id"], "path": name, "line": line,
+                             "message": f"{detail}. {rule['message']}{note}"})
+    return {"valid": not problems, "violations": problems, "tolerated_by_baseline": tolerated}
+
+
+def baseline(repo: Path, approved: bool) -> dict[str, Any]:
+    config = load_rules(repo)
+    previous = read_baseline(repo)
+    counts: dict[str, dict[str, int]] = {}
+    for rule, name, found in scan(repo, config, None, [], None):
+        counts.setdefault(rule["id"], {})[name] = len(found)
+    grew = sorted(f"{rule} {name}" for rule, files in counts.items() for name, count in files.items()
+                  if count > previous.get(rule, {}).get(name, 0))
+    if grew and (repo / BASELINE).is_file() and not approved:
+        raise Invalid("the baseline only shrinks. These would grow: " + ", ".join(grew[:10]) +
+                      ". Fix the new violations, or have the owner rerun this with --owner-approved.")
+    (repo / BASELINE).parent.mkdir(parents=True, exist_ok=True)
+    (repo / BASELINE).write_text(json.dumps({"version": 1, "counts": counts}, indent=2, sort_keys=True) + "\n",
+                                 encoding="utf-8")
+    return {"valid": True, "baseline": BASELINE, "violations_recorded": sum(sum(f.values()) for f in counts.values())}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="rulekit", description=__doc__.splitlines()[0])
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    commands = parser.add_subparsers(dest="command", required=True)
+    check_parser = commands.add_parser("check")
+    check_parser.add_argument("--rule", help="check only this rule ID")
+    check_parser.add_argument("--as", dest="alias", help="treat the single given file as if it lived at this path")
+    check_parser.add_argument("paths", nargs="*", help="check exactly these files, ignoring include, exclude and baseline")
+    baseline_parser = commands.add_parser("baseline")
+    baseline_parser.add_argument("--owner-approved", action="store_true",
+                                 help="lets the baseline grow; only the owner supplies it")
+    args = parser.parse_args()
+    repo = Path(args.repo).resolve()
+    try:
+        if args.command == "check":
+            if args.alias and len(args.paths) != 1:
+                raise Invalid("--as needs exactly one file")
+            result = check(repo, args.rule, args.paths, args.alias)
+        else:
+            result = baseline(repo, args.owner_approved)
+    except Invalid as exc:
+        print(json.dumps({"error": str(exc)}) if args.json else f"error: {exc}", file=sys.stderr if not args.json else sys.stdout)
+        return 2
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        for item in result.get("violations", []):
+            print(f"{item['path']}:{item['line']}: {item['rule']} {item['message']}", file=sys.stderr)
+        if result.get("tolerated_by_baseline"):
+            print(f"{result['tolerated_by_baseline']} older violation(s) tolerated by the baseline; clean them up, "
+                  "then run 'rulekit baseline'")
+        if "baseline" in result:
+            print(f"recorded {result['violations_recorded']} violation(s) in {result['baseline']}")
+        else:
+            print("valid" if result["valid"] else f"invalid: {len(result['violations'])} violation(s)")
+    return 0 if result["valid"] else 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
