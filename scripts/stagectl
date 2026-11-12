@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Freeze a stage's intent and checks, run the checks, and close on current evidence.
+
+freeze     freeze an owner-approved contract for this worktree
+run-check  execute frozen checks and record content-bound receipts
+status     read-only readiness report
+close      close the stage; succeeds only when every receipt is current
+verify     independent verdict: rerun the checks from a different worktree
+revise     replace the contract with an owner-approved successor
+cancel     abandon the stage without completing it
+
+One stage per worktree, so parallel agents in separate worktrees do not collide.
+State lives under <git-common-dir>/governance-v3/. Standard library and Git only;
+Linux, macOS and Windows.
+Exit codes: 0 ok, 2 invalid invocation, 3 checks failed or stale, 4 owner approval needed.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import hashlib
+from importlib.machinery import SourceFileLoader
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Iterator
+import uuid
+
+_loader = SourceFileLoader("verifyctl", str(Path(__file__).resolve().with_name("verifyctl")))
+_spec = importlib.util.spec_from_loader("verifyctl", _loader)
+verifyctl = importlib.util.module_from_spec(_spec)
+_loader.exec_module(verifyctl)
+
+CONTRACT_FIELDS = {"version", "name", "intent", "review", "inputs", "outputs", "acceptance", "checks"}
+REVIEWS = ("independent", "none")
+VAGUE = re.compile(r"^(todo|tbd|n/?a|none|placeholder|\.+)$", re.IGNORECASE)
+
+
+class Invalid(Exception):
+    """Invalid invocation or unusable state (exit 2)."""
+
+
+class Gate(Exception):
+    """An owner decision is required (exit 4)."""
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def meaningful(value: Any) -> bool:
+    return isinstance(value, str) and len(value.strip()) >= 12 and not VAGUE.match(value.strip())
+
+
+def git(repo: Path, *args: str) -> str:
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise Invalid(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def worktree_root(repo: str) -> Path:
+    path = Path(repo).resolve()
+    if not path.is_dir():
+        raise Invalid(f"repository not found: {repo}")
+    return Path(git(path, "rev-parse", "--show-toplevel"))
+
+
+def state_dir(root: Path) -> Path:
+    common = Path(git(root, "rev-parse", "--git-common-dir"))
+    return (common if common.is_absolute() else root / common).resolve() / "governance-v3"
+
+
+def pointer_path(root: Path) -> Path:
+    return state_dir(root) / "active" / (hashlib.sha256(str(root).encode()).hexdigest()[:32] + ".json")
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as exc:
+        raise Invalid(f"{path}: not valid JSON ({exc})") from exc
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def publish(path: Path, value: Any) -> None:
+    """Create only: history is never overwritten."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, path)
+    finally:
+        os.unlink(temporary)
+
+
+@contextmanager
+def locked(root: Path) -> Iterator[None]:
+    directory = state_dir(root)
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(directory / "lock", "a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            while True:  # msvcrt has no blocking lock without a timeout, so poll.
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def local_file(root: Path, value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute() or not path.parts or any(part in {"..", ".git"} for part in path.parts):
+        raise Invalid(f"expected a repository-relative file outside .git: {value}")
+    current = root
+    for part in path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise Invalid(f"stage references cannot traverse symlinks: {value}")
+    return current
+
+
+def file_ref(root: Path, value: str) -> dict[str, str]:
+    path = local_file(root, value)
+    if not path.is_file() or not path.stat().st_size:
+        raise Invalid(f"must be an existing nonempty file: {value}")
+    return {"path": value, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def contract_errors(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return ["contract must be an object"]
+    errors: list[str] = []
+    if set(value) != CONTRACT_FIELDS or value.get("version") != 1:
+        errors.append("contract requires exactly version=1, name, intent, review, inputs, outputs, acceptance and checks")
+    if value.get("review") not in REVIEWS:
+        errors.append("contract review must be 'independent' or 'none'")
+    if not meaningful(value.get("name")) and not (isinstance(value.get("name"), str) and len(value["name"].strip()) >= 3):
+        errors.append("contract name is missing")
+    if not meaningful(value.get("intent")):
+        errors.append("contract intent must restate the goal in a full sentence")
+    for key in ("inputs", "outputs"):
+        paths = value.get(key)
+        if not isinstance(paths, list) or any(not isinstance(p, str) or not p.strip() for p in paths):
+            errors.append(f"contract {key} must be a list of file paths")
+        elif len(set(paths)) != len(paths):
+            errors.append(f"contract {key} contains duplicate paths")
+    check_ids: set[str] = set()
+    checks = value.get("checks")
+    if not isinstance(checks, list) or not checks:
+        errors.append("contract needs at least one executable check")
+        checks = []
+    for check in checks:
+        if not isinstance(check, dict) or set(check) != {"id", "argv", "timeout_seconds"}:
+            errors.append("each check requires exactly id, argv and timeout_seconds")
+            continue
+        identifier = check.get("id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"CHK-\d{3,}", identifier) or identifier in check_ids:
+            errors.append("check IDs must be unique CHK-### definitions")
+        else:
+            check_ids.add(identifier)
+        argv = check.get("argv")
+        if not isinstance(argv, list) or not argv or any(not isinstance(a, str) or not a or "\0" in a for a in argv):
+            errors.append("check argv must be a nonempty array of nonempty strings, not a shell command")
+        timeout = check.get("timeout_seconds")
+        if type(timeout) is not int or not 1 <= timeout <= 3600:
+            errors.append("check timeout_seconds must be an integer from 1 to 3600")
+    acceptance = value.get("acceptance")
+    if not isinstance(acceptance, list) or not acceptance:
+        errors.append("contract needs at least one acceptance obligation")
+        acceptance = []
+    used: set[str] = set()
+    covered: set[str] = set()
+    for item in acceptance:
+        if not isinstance(item, dict) or set(item) != {"id", "description", "checks"}:
+            errors.append("each acceptance obligation requires exactly id, description and checks")
+            continue
+        identifier = item.get("id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"AC-\d{3,}", identifier) or identifier in used:
+            errors.append("acceptance IDs must be unique AC-### definitions")
+        else:
+            used.add(identifier)
+        if not meaningful(item.get("description")):
+            errors.append("acceptance descriptions must state an observable outcome")
+        refs = item.get("checks")
+        if not isinstance(refs, list) or not refs or len(set(refs)) != len(refs) or set(refs) - check_ids:
+            errors.append("acceptance checks must reference unique defined check IDs")
+        else:
+            covered.update(refs)
+    if check_ids - covered:
+        errors.append("every check must support an acceptance obligation")
+    return errors
+
+
+def subject(root: Path, contract: dict[str, Any]) -> dict[str, Any]:
+    fingerprint = verifyctl.worktree_fingerprint(root)
+    if fingerprint is None:
+        raise Invalid("cannot fingerprint the worktree")
+    declared = {}
+    for value in sorted(set(contract["inputs"] + contract["outputs"])):
+        path = local_file(root, value)
+        declared[value] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    return {"content_fingerprint": fingerprint, "declared_files": declared}
+
+
+def active(root: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    pointer = read_json(pointer_path(root))
+    if not pointer:
+        raise Invalid("no active stage in this worktree; freeze a contract first")
+    directory = state_dir(root) / "stages" / pointer["stage_id"]
+    envelope = read_json(directory / "contract.json")
+    if not envelope or digest(envelope) != pointer["contract_sha256"]:
+        raise Invalid("frozen contract is missing or no longer matches the stage pointer")
+    return pointer, directory, envelope
+
+
+def build_envelope(root: Path, contract_path: str, revision: dict[str, Any] | None = None) -> dict[str, Any]:
+    value = read_json(local_file(root, contract_path))
+    if value is None:
+        raise Invalid(f"contract not found: {contract_path}")
+    errors = contract_errors(value)
+    if errors:
+        raise Invalid("; ".join(errors))
+    for output in value["outputs"]:
+        local_file(root, output)
+    envelope = {"contract": value, "inputs": [file_ref(root, p) for p in value["inputs"]],
+                "worktree": str(root), "frozen_at": now()}
+    if revision:
+        envelope["revision"] = revision
+    return envelope
+
+
+def activate(root: Path, envelope: dict[str, Any]) -> dict[str, Any]:
+    identifier = "ST-" + uuid.uuid4().hex
+    publish(state_dir(root) / "stages" / identifier / "contract.json", envelope)
+    write_json(pointer_path(root), {"stage_id": identifier, "contract_sha256": digest(envelope)})
+    return {"stage_id": identifier, "contract_sha256": digest(envelope)}
+
+
+def freeze(root: Path, contract_path: str, approved: bool) -> dict[str, Any]:
+    if not approved:
+        raise Gate("freezing a stage needs --owner-approved: the owner approves the intent and the checks once, up front")
+    with locked(root):
+        envelope = build_envelope(root, contract_path)
+        if read_json(pointer_path(root)):
+            _, _, previous = active(root)
+            if previous["contract"] == envelope["contract"] and previous["inputs"] == envelope["inputs"]:
+                return {"frozen": True, "changed": False}
+            raise Invalid("this worktree already has an active stage; use revise for changed scope or cancel to abandon it")
+        return {"frozen": True, "changed": True, **activate(root, envelope)}
+
+
+def revise(root: Path, contract_path: str, approved: bool, reason: str) -> dict[str, Any]:
+    if not approved:
+        raise Gate("revising a stage needs --owner-approved: changed scope or checks is a new agreement")
+    if not meaningful(reason):
+        raise Invalid("--reason must explain what changed")
+    with locked(root):
+        pointer, _, previous = active(root)
+        envelope = build_envelope(root, contract_path, {
+            "from_stage_id": pointer["stage_id"], "from_contract_sha256": pointer["contract_sha256"],
+            "reason": reason.strip()})
+        if previous["contract"] == envelope["contract"] and previous["inputs"] == envelope["inputs"]:
+            raise Invalid("the proposed contract is identical to the active one; nothing to revise")
+        # The successor starts with no receipts: earlier evidence is never reused.
+        return {"revised": True, "previous_stage_id": pointer["stage_id"], **activate(root, envelope)}
+
+
+def inspect(root: Path) -> dict[str, Any]:
+    pointer, directory, envelope = active(root)
+    contract = envelope["contract"]
+    problems: list[dict[str, str]] = []
+
+    def issue(code: str, message: str) -> None:
+        problems.append({"code": code, "message": message})
+
+    for ref in envelope["inputs"]:
+        try:
+            if file_ref(root, ref["path"]) != ref:
+                issue("input-changed", f"frozen input changed: {ref['path']}; revise the stage")
+        except Invalid as exc:
+            issue("input-changed", str(exc))
+    for output in contract["outputs"]:
+        try:
+            file_ref(root, output)
+        except Invalid as exc:
+            issue("output-missing", str(exc))
+    current = subject(root, contract)
+    latest: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for path in sorted((directory / "checks").glob("*.json")):
+        attempt = read_json(path)
+        latest[attempt["check_id"]] = (path, attempt)
+    evidence = []
+    for check in contract["checks"]:
+        if check["id"] not in latest:
+            issue("check-missing", f"{check['id']}: not run yet")
+            continue
+        path, attempt = latest[check["id"]]
+        result = read_json(path.with_suffix(".result"))
+        log = path.with_suffix(".log")
+        if (not result or result.get("record_sha256") != digest({k: v for k, v in result.items() if k != "record_sha256"})
+                or result.get("attempt_sha256") != digest(attempt)
+                or attempt.get("contract_sha256") != pointer["contract_sha256"]
+                or not log.is_file() or hashlib.sha256(log.read_bytes()).hexdigest() != result.get("log_sha256")):
+            issue("evidence-corrupt", f"{check['id']}: interrupted, incomplete or altered execution record")
+            continue
+        if result["status"] != "passed":
+            issue("check-failed", f"{check['id']}: latest attempt {result['status']}; see {log}")
+        elif attempt["subject"] != current or result["subject_after"] != current:
+            issue("check-stale", f"{check['id']}: the code changed after this check passed; run it again")
+        evidence.append({"check_id": check["id"], "attempt": path.name, "result_sha256": digest(result)})
+    verdict = None
+    if contract["review"] == "independent":
+        verdicts = sorted((directory / "verdicts").glob("*/verdict.json"))
+        verdict = read_json(verdicts[-1]) if verdicts else None
+        if not verdict:
+            issue("review-missing", "no independent verdict yet; run 'stagectl verify' from a different worktree")
+        elif verdict.get("record_sha256") != digest({k: v for k, v in verdict.items() if k != "record_sha256"}):
+            issue("evidence-corrupt", "the independent verdict record was altered")
+        elif verdict["contract_sha256"] != pointer["contract_sha256"] or verdict["subject"] != current:
+            issue("review-stale", "the code changed after the independent verdict; verify again")
+        elif verdict["outcome"] != "pass":
+            issue("review-failed", f"independent verdict: {verdict['outcome']}; {verdict['summary']}")
+    return {"stage_id": pointer["stage_id"], "name": contract["name"], "intent": contract["intent"],
+            "review": contract["review"], "verdict": digest(verdict) if verdict else None,
+            "ready": not problems, "problems": problems, "evidence": evidence, "subject": current,
+            "contract_sha256": pointer["contract_sha256"]}
+
+
+def execute(root: Path, check: dict[str, Any], log: Path) -> tuple[int | None, str]:
+    """Run one frozen argv in root without a shell; the combined output goes to log."""
+    code, status = None, "failed"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as handle:
+        try:
+            group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                     else {"start_new_session": True})
+            process = subprocess.Popen(check["argv"], cwd=root, stdin=subprocess.DEVNULL, stdout=handle,
+                                       stderr=subprocess.STDOUT, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                                       **group)
+            try:
+                code = process.wait(timeout=check["timeout_seconds"])
+                status = "passed" if code == 0 else "failed"
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    # Kill the whole tree; taskkill is part of Windows.
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
+                    process.kill()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                status = "timed-out"
+        except OSError:
+            status = "could-not-start"
+    return code, status
+
+
+def run_one(root: Path, identifier: str) -> dict[str, Any]:
+    pointer, directory, envelope = active(root)
+    check = next((c for c in envelope["contract"]["checks"] if c["id"] == identifier), None)
+    if not check:
+        raise Invalid(f"unknown check ID: {identifier}")
+    attempts = sorted((directory / "checks").glob("*.json"))
+    path = directory / "checks" / f"{max((int(p.stem) for p in attempts), default=0) + 1:08d}.json"
+    before = subject(root, envelope["contract"])
+    attempt = {"check_id": identifier, "argv": check["argv"], "subject": before,
+               "contract_sha256": pointer["contract_sha256"], "started_at": now()}
+    publish(path, attempt)  # Recorded first, so an interrupted attempt supersedes an older pass.
+    log = path.with_suffix(".log")
+    code, status = execute(root, check, log)
+    after = subject(root, envelope["contract"])
+    if status == "passed" and before != after:
+        status = "changed-subject"  # A check that edits the code cannot certify the result.
+    result = {"attempt_sha256": digest(attempt), "returncode": code, "status": status, "subject_after": after,
+              "finished_at": now(), "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest()}
+    result["record_sha256"] = digest(result)
+    publish(path.with_suffix(".result"), result)
+    return {"check_id": identifier, "status": status, "log": str(log)}
+
+
+def run_checks(root: Path, identifier: str | None) -> dict[str, Any]:
+    with locked(root):
+        _, _, envelope = active(root)
+        targets = [identifier] if identifier else [c["id"] for c in envelope["contract"]["checks"]]
+        results = [run_one(root, target) for target in targets]
+    return {"results": results, "passed": all(r["status"] == "passed" for r in results)}
+
+
+def verify(root: Path, stage_id: str, outcome: str, summary: str) -> dict[str, Any]:
+    """Record an independent verdict from a worktree other than the author's.
+
+    The verifier's checkout must hold exactly the author's code, which forces the work
+    to be committed, and every frozen check is rerun there. Only a verifier that
+    declares pass, with every rerun passing, yields a passing verdict.
+    """
+    if not re.fullmatch(r"ST-[0-9a-f]{32}", stage_id):
+        raise Invalid("--stage must be a stage ID such as ST-...")
+    if not meaningful(summary):
+        raise Invalid("--summary must say what was driven and what was observed")
+    with locked(root):
+        directory = state_dir(root) / "stages" / stage_id
+        envelope = read_json(directory / "contract.json")
+        if not envelope:
+            raise Invalid(f"unknown stage: {stage_id}")
+        author = Path(envelope["worktree"])
+        if author == root:
+            raise Invalid("an independent verdict must come from a different worktree than the one that did the work")
+        pointer = read_json(pointer_path(author)) if author.is_dir() else None
+        if not pointer or pointer["stage_id"] != stage_id:
+            raise Invalid("that stage is not active in its worktree")
+        contract = envelope["contract"]
+        if contract["review"] != "independent":
+            raise Invalid("this stage's contract does not call for an independent verdict")
+        target = subject(author, contract)
+        before = subject(root, contract)
+        if before != target:
+            raise Invalid("this worktree does not hold the author's exact code: the author commits everything, "
+                          "then the verifier checks out that commit with no other changes (keep repro files "
+                          "under a Git-ignored directory such as .verify/)")
+        existing = sorted((directory / "verdicts").glob("*"))
+        home = directory / "verdicts" / f"{max((int(p.name) for p in existing), default=0) + 1:08d}"
+        results = []
+        for check in contract["checks"]:
+            log = home / f"{check['id']}.log"
+            code, status = execute(root, check, log)
+            results.append({"check_id": check["id"], "status": status, "returncode": code,
+                            "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest()})
+        if subject(root, contract) != before:
+            final = "invalid"
+            summary = "the verifier's worktree changed while the checks ran; " + summary
+        elif any(r["status"] != "passed" for r in results):
+            final = "fail"
+        else:
+            final = outcome
+        verdict = {"stage_id": stage_id, "contract_sha256": pointer["contract_sha256"], "subject": target,
+                   "declared": outcome, "outcome": final, "summary": summary.strip(), "checks": results,
+                   "verifier_worktree": str(root), "recorded_at": now()}
+        verdict["record_sha256"] = digest(verdict)
+        publish(home / "verdict.json", verdict)
+    return {"stage_id": stage_id, "outcome": final, "results": results, "verdict": str(home / "verdict.json")}
+
+
+def close(root: Path) -> dict[str, Any]:
+    with locked(root):
+        report = inspect(root)
+        if not report["ready"]:
+            return {"closed": False, **report}
+        directory = state_dir(root) / "stages" / report["stage_id"]
+        closure = {key: report[key] for key in ("stage_id", "contract_sha256", "subject", "evidence", "verdict")}
+        closure["closed_at"] = now()
+        publish(directory / "closure.json", closure)
+        pointer_path(root).unlink()
+    return {"closed": True, "stage_id": report["stage_id"], "receipt": str(directory / "closure.json")}
+
+
+def cancel(root: Path, reason: str) -> dict[str, Any]:
+    if not meaningful(reason):
+        raise Invalid("--reason must explain why the stage is abandoned")
+    with locked(root):
+        pointer, directory, _ = active(root)
+        publish(directory / "cancellation.json", {**pointer, "reason": reason.strip(), "cancelled_at": now(),
+                                                  "completed": False})
+        pointer_path(root).unlink()
+    return {"cancelled": True, "completed": False, "stage_id": pointer["stage_id"]}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="stagectl", description=__doc__.splitlines()[0])
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("freeze", "revise"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--contract", required=True, help="repository-relative contract JSON")
+        sub.add_argument("--owner-approved", action="store_true",
+                         help="records approval the owner already gave; never supply it speculatively")
+        if name == "revise":
+            sub.add_argument("--reason", required=True)
+    check_parser = commands.add_parser("run-check")
+    target = check_parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--id")
+    target.add_argument("--all", action="store_true")
+    commands.add_parser("status")
+    verify_parser = commands.add_parser("verify")
+    verify_parser.add_argument("--stage", required=True, help="stage ID reported by the author's freeze or status")
+    verify_parser.add_argument("--outcome", required=True, choices=["pass", "fail"])
+    verify_parser.add_argument("--summary", required=True)
+    commands.add_parser("close")
+    commands.add_parser("cancel").add_argument("--reason", required=True)
+    args = parser.parse_args()
+    try:
+        root = worktree_root(args.repo)
+        if args.command == "freeze":
+            result, code = freeze(root, args.contract, args.owner_approved), 0
+        elif args.command == "revise":
+            result, code = revise(root, args.contract, args.owner_approved, args.reason), 0
+        elif args.command == "run-check":
+            result = run_checks(root, args.id)
+            code = 0 if result["passed"] else 3
+        elif args.command == "status":
+            result = inspect(root)
+            code = 0 if result["ready"] else 3
+        elif args.command == "verify":
+            result = verify(root, args.stage, args.outcome, args.summary)
+            code = 0 if result["outcome"] == "pass" else 3
+        elif args.command == "close":
+            result = close(root)
+            code = 0 if result["closed"] else 3
+        else:
+            result, code = cancel(root, args.reason), 0
+    except Gate as exc:
+        result, code = {"error": str(exc)}, 4
+    except (Invalid, verifyctl.Invalid) as exc:
+        result, code = {"error": str(exc)}, 2
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        if "error" in result:
+            print(f"error: {result['error']}", file=sys.stderr)
+        for problem in result.get("problems", []):
+            print(f"blocked: {problem['message']}", file=sys.stderr)
+        for item in result.get("results", []):
+            print(f"{item['check_id']}: {item['status']}")
+        summary = {k: v for k, v in result.items() if k in ("frozen", "changed", "revised", "closed", "cancelled",
+                                                            "ready", "passed", "stage_id", "receipt", "outcome",
+                                                            "verdict")}
+        if summary:
+            print(json.dumps(summary))
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
