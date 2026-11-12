@@ -3,12 +3,17 @@
 
 check     fail when a file breaks a rule beyond the recorded baseline
 baseline  record today's violations so only new ones fail; it can only shrink
+survey    report where the code is weakest: long files, excuses, suppressions, baseline left
 
-Three kinds of rule:
-  ban-comments  no comments in the matched files (Python and C-style languages)
-  ban-import    files under `include` must not import from the `forbid` directories,
-                or use a specifier matching `forbid_specifiers`
-  ban-pattern   no line in the matched files matches `pattern`
+Six kinds of rule:
+  ban-comments    no comments in the matched files (Python and C-style languages)
+  ban-import      files under `include` must not import from the `forbid` directories,
+                  or use a specifier matching `forbid_specifiers`
+  ban-pattern     no line in the matched files matches `pattern`
+  max-lines       no matched file is longer than `max` lines
+  require-layout  every matched file sits at a path matching one of the `paths` globs
+  linter          run the project's own linter or type checker (`argv`, plus `target`
+                  when no files are named) and hold its findings to the same baseline
 
 {"version": 1, "exclude": ["dist/**"], "rules": [
   {"id": "R-001", "kind": "ban-comments", "include": ["src/**/*.ts"], "allow": ["^eslint-"],
@@ -23,7 +28,11 @@ Paths given on the command line are checked whatever `include`, `exclude` and th
 baseline say; that is how a rule's proof runs it against a committed bad example.
 `--as PATH` checks one such file as if it lived at PATH.
 
-Standard library only. Exit codes: 0 ok, 2 invalid invocation, 3 violations found.
+A `linter` rule reads findings as `path:line: message` or `path(line,col): message`
+lines, or as ESLint's JSON with `"format": "eslint-json"`.
+
+Standard library only. Exit codes: 0 ok, 2 invalid invocation, 3 violations found,
+127 a linter rule's tool is not installed.
 """
 
 from __future__ import annotations
@@ -34,6 +43,7 @@ import json
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
+import shutil
 import subprocess
 import sys
 import tokenize
@@ -41,7 +51,15 @@ from typing import Any
 
 RULES = ".governance/rules.json"
 BASELINE = ".governance/baseline.json"
-KINDS = ("ban-comments", "ban-import", "ban-pattern")
+KINDS = ("ban-comments", "ban-import", "ban-pattern", "max-lines", "require-layout", "linter")
+FORMATS = ("lines", "eslint-json")
+LINTER_TIMEOUT = 900
+FINDING = re.compile(r"^\s*(?P<path>(?:[A-Za-z]:)?[^\s:(][^:(\n]*?)(?:\((?P<paren>\d+),\d+\)|:(?P<colon>\d+))(?::\d+)?"
+                     r"\s*[:-]?\s*(?P<message>.*)$")
+EXCUSE = re.compile(r"\b(TODO|FIXME|HACK|XXX|workaround|work around|temporar(?:y|ily)|for now|quick fix)\b", re.I)
+SUPPRESSIONS = {"eslint-disable": r"eslint-disable", "@ts-ignore": r"@ts-(?:ignore|nocheck)",
+                "@ts-expect-error": r"@ts-expect-error", "as any": r"\bas any\b", "type: ignore": r"type:\s*ignore",
+                "noqa": r"#\s*noqa", "pylint: disable": r"pylint:\s*disable", "nolint": r"//\s*nolint"}
 C_STYLE = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts", ".java", ".kt", ".go", ".rs", ".c", ".h",
            ".cc", ".cpp", ".hpp", ".cs", ".swift", ".dart", ".scala"}
 SCRIPT = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"}
@@ -52,6 +70,10 @@ REGEX_AFTER = set("(,=:[!&|?{};+-*%<>~^")
 
 
 class Invalid(Exception):
+    pass
+
+
+class Missing(Invalid):
     pass
 
 
@@ -97,13 +119,21 @@ def load_rules(repo: Path) -> dict[str, Any]:
             raise Invalid(f"{name}: message must tell the agent what to do instead")
         if not strings(rule.get("include")) or not rule["include"]:
             raise Invalid(f"{name}: include must be a nonempty list of path globs")
-        for key in ("allow", "forbid", "forbid_specifiers", "python_roots"):
+        for key in ("allow", "forbid", "forbid_specifiers", "python_roots", "paths", "argv", "target"):
             if key in rule and not strings(rule[key]):
                 raise Invalid(f"{name}: {key} must be a list of strings")
         if rule["kind"] == "ban-import" and not (rule.get("forbid") or rule.get("forbid_specifiers")):
             raise Invalid(f"{name}: a ban-import rule needs forbid or forbid_specifiers")
         if rule["kind"] == "ban-pattern" and not isinstance(rule.get("pattern"), str):
             raise Invalid(f"{name}: a ban-pattern rule needs a pattern")
+        if rule["kind"] == "max-lines" and not (type(rule.get("max")) is int and rule["max"] > 0):
+            raise Invalid(f"{name}: a max-lines rule needs max, a positive whole number")
+        if rule["kind"] == "require-layout" and not rule.get("paths"):
+            raise Invalid(f"{name}: a require-layout rule needs paths, the globs a file may sit at")
+        if rule["kind"] == "linter" and not rule.get("argv"):
+            raise Invalid(f"{name}: a linter rule needs argv, the command to run")
+        if rule.get("format", "lines") not in FORMATS:
+            raise Invalid(f"{name}: format must be one of {', '.join(FORMATS)}")
         try:
             for expression in [rule.get("pattern", ""), *rule.get("allow", []), *rule.get("forbid_specifiers", [])]:
                 re.compile(expression)
@@ -230,6 +260,11 @@ def violations(rule: dict[str, Any], path: str, text: str) -> list[tuple[int, st
         allowed = [re.compile(item) for item in rule.get("allow", [])]
         return [(line, f"comment: {body[:60]}") for line, body in comments
                 if not any(pattern.search(body) for pattern in allowed)]
+    if rule["kind"] == "max-lines":
+        count = len(text.splitlines())
+        return [(rule["max"] + 1, f"{count} lines; the limit is {rule['max']}")] if count > rule["max"] else []
+    if rule["kind"] == "require-layout":
+        return [] if matches(rule["paths"], path) else [(1, "this path is outside the allowed layout")]
     if rule["kind"] == "ban-pattern":
         pattern = re.compile(rule["pattern"])
         return [(number, f"matches {rule['pattern']}") for number, line in enumerate(text.splitlines(), 1)
@@ -245,11 +280,60 @@ def violations(rule: dict[str, Any], path: str, text: str) -> list[tuple[int, st
     return found
 
 
+def weight(rule: dict[str, Any], text: str, found: list[tuple[int, str]]) -> int:
+    """What the baseline counts: lines over the limit for max-lines, findings otherwise."""
+    return len(text.splitlines()) - rule["max"] if rule["kind"] == "max-lines" else len(found)
+
+
+def relative(repo: Path, raw: str) -> str | None:
+    path = Path(raw.strip().replace("\\", "/"))
+    try:
+        resolved = (path if path.is_absolute() else repo / path).resolve()
+        return resolved.relative_to(repo).as_posix() if resolved.is_file() else None
+    except (ValueError, OSError):
+        return None
+
+
+def run_linter(repo: Path, rule: dict[str, Any], paths: list[str]) -> dict[str, list[tuple[int, str]]]:
+    argv = [*rule["argv"], *(paths or rule.get("target", []))]
+    program = sys.executable if argv[0] in ("python", "python3") else shutil.which(argv[0])
+    if not program:
+        raise Missing(f"{rule['id']}: {argv[0]} is not installed. {rule.get('install', '')}".strip())
+    try:
+        result = subprocess.run([program, *argv[1:]], cwd=repo, capture_output=True, text=True, check=False,
+                                timeout=LINTER_TIMEOUT, encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        raise Invalid(f"{rule['id']}: {argv[0]} did not finish in {LINTER_TIMEOUT} seconds") from None
+    found: dict[str, list[tuple[int, str]]] = {}
+    if rule.get("format") == "eslint-json":
+        try:
+            report = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            report = []
+        for entry in report if isinstance(report, list) else []:
+            name = relative(repo, str(entry.get("filePath", "")))
+            for item in entry.get("messages", []) if name else []:
+                found.setdefault(name, []).append(
+                    (int(item.get("line") or 1), f"{item.get('ruleId') or 'error'}: {item.get('message', '')}"))
+    else:
+        for line in (result.stdout + "\n" + result.stderr).splitlines():
+            match = FINDING.match(line)
+            name = relative(repo, match.group("path")) if match else None
+            if name:
+                found.setdefault(name, []).append(
+                    (int(match.group("paren") or match.group("colon")), match.group("message").strip()))
+    if result.returncode != 0 and not found:
+        tail = " ".join((result.stderr or result.stdout).split())[-300:]
+        raise Invalid(f"{rule['id']}: {argv[0]} failed without naming a file: {tail}")
+    return found
+
+
 def scan(repo: Path, config: dict[str, Any], only: str | None, paths: list[str], alias: str | None):
-    """Yield (rule, path, [(line, detail)]) for every file with violations."""
+    """Yield (rule, path, [(line, detail)], baseline weight) for every file with violations."""
     rules = [rule for rule in config["rules"] if only in (None, rule["id"])]
     if only and not rules:
         raise Invalid(f"unknown rule: {only}")
+    excluded = (*ALWAYS_EXCLUDED, *config.get("exclude", []))
     if paths:
         targets = []
         for value in paths:
@@ -261,10 +345,9 @@ def scan(repo: Path, config: dict[str, Any], only: str | None, paths: list[str],
             except ValueError:
                 raise Invalid(f"file is outside the repository: {value}") from None
     else:
-        excluded = (*ALWAYS_EXCLUDED, *config.get("exclude", []))
         targets = [(repo / name, name) for name in repository_files(repo) if not matches(excluded, name)]
     for path, name in targets:
-        applicable = [rule for rule in rules if paths or matches(rule["include"], name)]
+        applicable = [rule for rule in rules if rule["kind"] != "linter" and (paths or matches(rule["include"], name))]
         if not applicable:
             continue
         try:
@@ -274,7 +357,16 @@ def scan(repo: Path, config: dict[str, Any], only: str | None, paths: list[str],
         for rule in applicable:
             found = violations(rule, name, text)
             if found:
-                yield rule, name, found
+                yield rule, name, found, weight(rule, text, found)
+    for rule in rules:
+        if rule["kind"] != "linter":
+            continue
+        if alias:
+            raise Invalid(f"{rule['id']}: --as does not apply to a linter rule; name the file where it is")
+        named = [path.resolve().relative_to(repo).as_posix() for path, _ in targets] if paths else []
+        for name, found in sorted(run_linter(repo, rule, named).items()):
+            if paths or (matches(rule["include"], name) and not matches(excluded, name)):
+                yield rule, name, sorted(found), len(found)
 
 
 def read_baseline(repo: Path) -> dict[str, dict[str, int]]:
@@ -287,19 +379,19 @@ def read_baseline(repo: Path) -> dict[str, dict[str, int]]:
     return value.get("counts", {}) if isinstance(value, dict) else {}
 
 
-def check(repo: Path, only: str | None, paths: list[str], alias: str | None) -> dict[str, Any]:
+def check(repo: Path, only: str | None, paths: list[str], alias: str | None, everything: bool = False) -> dict[str, Any]:
     config = load_rules(repo)
-    allowed = {} if paths else read_baseline(repo)
+    allowed = {} if paths or everything else read_baseline(repo)
     problems, tolerated = [], 0
-    for rule, name, found in scan(repo, config, only, paths, alias):
+    for rule, name, found, size in scan(repo, config, only, paths, alias):
         limit = allowed.get(rule["id"], {}).get(name, 0)
-        if len(found) <= limit:
-            tolerated += len(found)
+        if size <= limit:
+            tolerated += size
             continue
-        note = f" (this file has {len(found)}; the baseline allows {limit})" if limit else ""
+        note = f" (this file has {size}; the baseline allows {limit})" if limit else ""
         for line, detail in found:
             problems.append({"rule": rule["id"], "path": name, "line": line,
-                             "message": f"{detail}. {rule['message']}{note}"})
+                             "message": f"{detail.rstrip('.')}. {rule['message']}{note}"})
     return {"valid": not problems, "violations": problems, "tolerated_by_baseline": tolerated}
 
 
@@ -307,8 +399,8 @@ def baseline(repo: Path, approved: bool) -> dict[str, Any]:
     config = load_rules(repo)
     previous = read_baseline(repo)
     counts: dict[str, dict[str, int]] = {}
-    for rule, name, found in scan(repo, config, None, [], None):
-        counts.setdefault(rule["id"], {})[name] = len(found)
+    for rule, name, _, size in scan(repo, config, None, [], None):
+        counts.setdefault(rule["id"], {})[name] = size
     grew = sorted(f"{rule} {name}" for rule, files in counts.items() for name, count in files.items()
                   if count > previous.get(rule, {}).get(name, 0))
     if grew and (repo / BASELINE).is_file() and not approved:
@@ -320,6 +412,50 @@ def baseline(repo: Path, approved: bool) -> dict[str, Any]:
     return {"valid": True, "baseline": BASELINE, "violations_recorded": sum(sum(f.values()) for f in counts.values())}
 
 
+def survey(repo: Path) -> dict[str, Any]:
+    """Facts for the gardener: where the code is most likely to teach the next agent a bad habit."""
+    try:
+        excluded = (*ALWAYS_EXCLUDED, *load_rules(repo).get("exclude", []))
+    except Invalid:
+        excluded = ALWAYS_EXCLUDED
+    sizes: dict[str, int] = {}
+    folders: dict[str, int] = {}
+    excuses: dict[str, int] = {}
+    suppressed: dict[str, int] = {}
+    kinds = {label: 0 for label in SUPPRESSIONS}
+    patterns = {label: re.compile(expression) for label, expression in SUPPRESSIONS.items()}
+    samples: list[dict[str, Any]] = []
+    for name in repository_files(repo):
+        if matches(excluded, name) or PurePosixPath(name).suffix.lower() not in {".py", *C_STYLE}:
+            continue
+        try:
+            lines = (repo / name).read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError):
+            continue
+        sizes[name] = len(lines)
+        folder = posixpath.dirname(name) or "."
+        folders[folder] = folders.get(folder, 0) + 1
+        for number, line in enumerate(lines, 1):
+            if EXCUSE.search(line):
+                excuses[name] = excuses.get(name, 0) + 1
+                if len(samples) < 20:
+                    samples.append({"path": name, "line": number, "text": line.strip()[:120]})
+            for label, pattern in patterns.items():
+                if pattern.search(line):
+                    kinds[label] += 1
+                    suppressed[name] = suppressed.get(name, 0) + 1
+
+    def top(counts: dict[str, int], size: int = 15) -> list[dict[str, Any]]:
+        return [{"path": name, "count": count} for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:size]]
+
+    return {"valid": True, "source_files": len(sizes), "longest_files": top(sizes), "fullest_folders": top(folders, 10),
+            "excuses": {"total": sum(excuses.values()), "files": top(excuses), "samples": samples},
+            "suppressions": {"total": sum(kinds.values()), "by_kind": {k: v for k, v in kinds.items() if v},
+                             "files": top(suppressed)},
+            "baseline_left": {rule: {"total": sum(files.values()), "files": len(files), "worst": top(files, 5)}
+                              for rule, files in sorted(read_baseline(repo).items())}}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="rulekit", description=__doc__.splitlines()[0])
     parser.add_argument("--repo", default=".")
@@ -327,24 +463,29 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     check_parser = commands.add_parser("check")
     check_parser.add_argument("--rule", help="check only this rule ID")
+    check_parser.add_argument("--no-baseline", action="store_true",
+                              help="report every violation, including the older ones the baseline tolerates")
     check_parser.add_argument("--as", dest="alias", help="treat the single given file as if it lived at this path")
     check_parser.add_argument("paths", nargs="*", help="check exactly these files, ignoring include, exclude and baseline")
     baseline_parser = commands.add_parser("baseline")
     baseline_parser.add_argument("--owner-approved", action="store_true",
                                  help="lets the baseline grow; only the owner supplies it")
+    commands.add_parser("survey")
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
     try:
         if args.command == "check":
             if args.alias and len(args.paths) != 1:
                 raise Invalid("--as needs exactly one file")
-            result = check(repo, args.rule, args.paths, args.alias)
+            result = check(repo, args.rule, args.paths, args.alias, args.no_baseline)
+        elif args.command == "survey":
+            result = survey(repo)
         else:
             result = baseline(repo, args.owner_approved)
     except Invalid as exc:
         print(json.dumps({"error": str(exc)}) if args.json else f"error: {exc}", file=sys.stderr if not args.json else sys.stdout)
-        return 2
-    if args.json:
+        return 127 if isinstance(exc, Missing) else 2
+    if args.json or args.command == "survey":
         print(json.dumps(result, indent=2))
     else:
         for item in result.get("violations", []):
