@@ -133,7 +133,8 @@ python tools/governance/rulekit survey
 
 The baseline records how many violations each file has today, so a rule can be switched
 on in an old codebase and fail only when a file gets worse. It only shrinks: growing it
-needs `--owner-approved`, which the hook stops an agent from passing.
+needs `--owner-approved`, which the hook stops an agent from passing unless the owner
+typed `/approve baseline`.
 
 Limits: `ban-comments` covers Python (exact, via the tokenizer) and C-style languages
 (a scanner that skips strings, templates and most regular-expression literals; an
@@ -204,7 +205,18 @@ freeze and again only for a revision. There is one stage per worktree, so agents
 separate worktrees run in parallel. `verifyctl check --fresh` ties recorded evidence to
 the current code, so a stage cannot close on proof gathered before the last edit.
 
-Limits: `--owner-approved` is an attestation, not authentication. A passing check does
+The owner approves in chat by typing `/approve`. Cursor's `beforeSubmitPrompt` hook sees
+that message, which an agent cannot write, and records a grant in the stage state
+directory. The grant lets the agent run one freeze or revise command, in the same
+conversation, within fifteen minutes, for the newest contract under `.governance/stages/`
+(or the one named, `/approve <short-name>`) exactly as it was when the owner typed it.
+`/approve baseline` does the same for one `rulekit baseline --owner-approved`. Without a
+grant the hook blocks these commands, and the owner can always run them in a terminal.
+
+Limits: `--owner-approved` is an attestation, not authentication. Whether Cursor passes a
+typed slash command to `beforeSubmitPrompt` unchanged is unconfirmed; if it does not, no
+grant is recorded and the terminal remains the way to approve. A stage in another
+worktree (as `/implement-spec` uses) is not covered by `/approve` yet. A passing check does
 not prove the check covers its acceptance item. Environment, services and toolchain
 versions are not part of the fingerprint. Reopening a closed stage is not implemented.
 State is local to the machine (`<git-common-dir>/governance-v3/`). The three scripts
