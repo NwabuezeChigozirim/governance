@@ -27,6 +27,10 @@ after its owner adopts it:
 python scripts/adopt.py --repo path/to/project
 ```
 
+In Cursor the owner types `/adopt` with the project open instead: it runs the same script,
+installs any linter the script names, commits the result and makes the `gate` job a
+required check. Agents never start it themselves.
+
 | It adds | Effect |
 |---|---|
 | `tools/governance/` | `stagectl`, `verifyctl`, `rulectl`, `rulekit`, so CI and the terminal can run them |

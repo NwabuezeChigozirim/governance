@@ -7,7 +7,7 @@ description: "Turn a correction into an enforced rule in minutes with the built-
 
 `rulekit` is a small linter that needs no dependencies and works on any language. Use it when the **correct** skill reaches the lint level and the project's own linter cannot express the rule quickly. A rule in the project's real linter or type system is still better when it exists; cite that instead.
 
-In an adopted project the tools are at `tools/governance/`. Run them as `python tools/governance/rulekit <command>`. If the project has no `.governance/rules.json`, ask the owner to run the plugin's `scripts/adopt.py --repo <project>` first.
+In an adopted project the tools are at `tools/governance/`. Run them as `python tools/governance/rulekit <command>`. If the project has no `.governance/rules.json`, ask the owner to type `/adopt` first.
 
 ## Add a rule
 

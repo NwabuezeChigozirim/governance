@@ -58,6 +58,14 @@ class PackageTests(unittest.TestCase):
                 continue
             self.assertNotIn("poteto-mode", path.read_text(encoding="utf-8"), path)
 
+    def test_what_only_the_owner_starts_is_never_loaded_by_an_agent(self) -> None:
+        for name in ("adopt", "setup-pstack", "govern", "stage", "correct", "garden"):
+            text = (SKILLS / name / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("disable-model-invocation: true", text.split("\n---\n", 1)[0], name)
+        adopt = (SKILLS / "adopt" / "SKILL.md").read_text(encoding="utf-8")
+        for needed in ("adopt.py --repo .", "rulekit check", "--prove", "contexts", "do not replace it"):
+            self.assertIn(needed, adopt)
+
     def test_scripts_named_by_skills_exist(self) -> None:
         for name in ("stagectl", "verifyctl", "rulectl", "rulekit", "adopt.py", "install.py"):
             self.assertTrue((PACKAGE / "scripts" / name).is_file())
