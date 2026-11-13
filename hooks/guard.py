@@ -79,7 +79,7 @@ def unproven_changes(stagectl, root: Path) -> list[str]:
     listing = stagectl.git(root, "status", "--porcelain", "--untracked-files=all")
     changed = sorted({parts[1].split(" -> ")[-1].strip('"') for parts in
                       (line.strip().split(None, 1) for line in listing.splitlines()) if len(parts) == 2})
-    changed = [name for name in changed if not stagectl.exempt(root, name, settings)]
+    changed = [name for name in changed if not stagectl.exempt(root, name, settings) and not stagectl.cache(name)]
     if not changed:
         return []
     tree = stagectl.governed_tree(root)

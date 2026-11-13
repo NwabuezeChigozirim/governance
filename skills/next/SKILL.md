@@ -29,7 +29,7 @@ Read [STEPS.md](../start/STEPS.md) and follow its rules for speaking to the owne
 | Step 5, everything waits on the owner | Tell them which tickets are theirs, offer the **wizard** skill for any with many steps, and stop |
 | Step 6, a pull request is open | Check its checks. If green, ask the owner to merge it. If red, find out why and fix it under the stage |
 | Step 6, every ticket closed | Close the spec, tell the owner what was built, and suggest they try it |
-| GitHub could not be reached | Give the owner the command it names and stop |
+| GitHub issues could not be read | Read the error it quotes. If it is on your side (a missing remote, a command that failed), fix it and run the script again. If only the owner can fix it (signing in), tell them exactly what to do and stop |
 
 ### The rules, before building
 
