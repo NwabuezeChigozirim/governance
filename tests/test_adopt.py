@@ -72,6 +72,42 @@ class AdoptTests(unittest.TestCase):
         self.assertEqual(guide.count("## Rules"), 1)
         self.assertIn("Be careful.", guide)
 
+    def test_adopting_again_after_the_project_gains_a_language_adds_its_strict_rules(self) -> None:
+        (self.repo / "src" / "app.ts").unlink()
+        self.adopt()
+        rules = self.repo / ".governance" / "rules.json"
+        self.assertEqual([rule["id"] for rule in json.loads(rules.read_text())["rules"]], ["R-001", "R-002"])
+        (self.repo / "src" / "app.py").write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
+        out = self.adopt()
+        found = json.loads(rules.read_text())["rules"]
+        self.assertEqual([rule["argv"][0] for rule in found if rule["kind"] == "linter"], ["ruff", "mypy"])
+        self.assertEqual([rule["id"] for rule in found], ["R-001", "R-002", "R-003", "R-004"])
+        guide = (self.repo / "AGENTS.md").read_text()
+        self.assertEqual(guide.count("| R-003 "), 1)
+        self.assertEqual(guide.count("| R-004 "), 1)
+        self.assertTrue((self.repo / ".governance" / "bad" / "R-004.py").is_file())
+        self.assertTrue((self.repo / "ruff.toml").is_file())
+        self.assertIn("pip install ruff mypy", (self.repo / ".github/workflows/governance.yml").read_text())
+        if shutil.which("ruff") and shutil.which("mypy"):
+            self.assertEqual(self.tool("rulekit", "check"), 0)
+            self.assertEqual(self.tool("rulectl", "check", "--repo", ".", "--prove"), 0)
+        else:
+            self.assertIn("NOT DONE", out)
+        before = (rules.read_text(), guide, (self.repo / ".github/workflows/governance.yml").read_text())
+        self.adopt()
+        self.assertEqual(before, (rules.read_text(), (self.repo / "AGENTS.md").read_text(),
+                                  (self.repo / ".github/workflows/governance.yml").read_text()))
+
+    def test_adopting_again_never_forgives_new_violations_of_an_old_rule(self) -> None:
+        self.adopt()
+        baseline = self.repo / ".governance" / "baseline.json"
+        self.assertEqual(json.loads(baseline.read_text())["counts"]["R-001"], {"src/app.ts": 1})
+        (self.repo / "src" / "app.ts").write_text("// legacy note\n// a new excuse\nexport const a = 1;\n", encoding="utf-8")
+        (self.repo / "src" / "tool.py").write_text("VALUE = 1\n", encoding="utf-8")
+        self.adopt()
+        self.assertEqual(json.loads(baseline.read_text())["counts"]["R-001"], {"src/app.ts": 1})
+        self.assertIn("**/*.py", json.loads((self.repo / ".governance/rules.json").read_text())["rules"][0]["include"])
+
     def test_file_length_rule_is_installed_and_proven(self) -> None:
         self.adopt()
         self.assertEqual(self.tool("rulekit", "check", "--rule", "R-002", ".governance/bad/R-002.ts"), 3)
