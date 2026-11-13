@@ -33,8 +33,8 @@ Check the state that changes the answer, and mention it only when it does:
 ## Get set up
 
 1. Install: from a checkout of the plugin, the owner runs `python scripts/install.py`, then restarts Cursor.
-2. Adopt each project: the owner runs `python scripts/adopt.py --repo <project>`. It adds the tools under `tools/governance/`, the starter rules, the strict linter and type-checker preset for the language, and the CI merge gate. If it prints `NOT DONE`, the owner installs the tools it names and runs `python tools/governance/rulekit baseline`.
-3. The owner commits the result to the main branch and makes the `gate` job a required check.
+2. Adopt each project: the owner types [`/adopt`](../adopt/SKILL.md) with the project open. It runs the adopt script, which adds the tools under `tools/governance/`, the starter rules, the strict linter and type-checker preset for the language, and the CI merge gate; installs any linter the script names; commits the result to the main branch; and makes the `gate` job a required check. The same script can be run from a terminal: `python scripts/adopt.py --repo <project>`.
+3. If the project was empty when adopted, the owner types `/adopt` again once it has source files, to add the strict rules for its language.
 4. Run [`/setup-pstack`](../setup-pstack/SKILL.md) once to pick a model for each role and a reasoning budget.
 5. Start a real task with `/govern`, a goal, and a check that can pass or fail.
 

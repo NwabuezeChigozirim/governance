@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Agents copy what they see. One workaround becomes the house style within weeks. Your job is to find what is spreading, write it down, and propose the rule that stops it. You do not fix anything in this skill.
 
-In an adopted project the tools are at `tools/governance/`. If there is no `.governance/rules.json`, ask the owner to run the plugin's `scripts/adopt.py --repo <project>` first.
+In an adopted project the tools are at `tools/governance/`. If there is no `.governance/rules.json`, ask the owner to type `/adopt` first.
 
 ## 1. Collect facts, not impressions
 
