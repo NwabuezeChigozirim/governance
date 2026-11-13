@@ -39,6 +39,7 @@ import time
 from typing import Any, Iterator
 import uuid
 
+sys.dont_write_bytecode = True
 _loader = SourceFileLoader("verifyctl", str(Path(__file__).resolve().with_name("verifyctl")))
 _spec = importlib.util.spec_from_loader("verifyctl", _loader)
 verifyctl = importlib.util.module_from_spec(_spec)
@@ -222,11 +223,17 @@ def exempt(root: Path, relative: str, settings: dict[str, Any] | None = None) ->
     return any(glob_regex(pattern).match(relative) for pattern in patterns)
 
 
+def cache(relative: str) -> bool:
+    """Interpreter caches: produced by running the code, never part of what was proven."""
+    parts = relative.split("/")
+    return "__pycache__" in parts or relative.endswith((".pyc", ".pyo"))
+
+
 def governed_tree(root: Path, ref: str | None = None) -> str:
     """Git tree ID of the governed content: the worktree, or a commit when ref is given.
 
     Built in a throwaway index, so the real index is untouched. Git-ignored files,
-    receipts, contract drafts and configured exempt paths are left out. Git applies its
+    receipts, contract drafts, configured exempt paths and Python caches are left out. Git applies its
     own line-ending rules, so the same content gives the same ID on every platform.
     """
     settings = config(root)
@@ -247,7 +254,7 @@ def governed_tree(root: Path, ref: str | None = None) -> str:
         else:
             run("read-tree", ref)
         names = [name for name in run("ls-files", "-z").split(b"\0") if name]
-        dropped = [name for name in names if exempt(root, os.fsdecode(name), settings)]
+        dropped = [name for name in names if exempt(root, os.fsdecode(name), settings) or cache(os.fsdecode(name))]
         if dropped:
             run("update-index", "--force-remove", "-z", "--stdin", data=b"\0".join(dropped) + b"\0")
         return run("write-tree").decode().strip()

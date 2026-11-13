@@ -275,6 +275,26 @@ class StagectlTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(self.codes(out), {"no-receipt"})
 
+    def test_gate_ignores_python_caches_left_by_running_the_code(self) -> None:
+        self.proven()
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "proven")
+        self.write("tools/governance/__pycache__/verifyctlcpython-312.pyc", "cache")
+        self.write("app/__pycache__/main.cpython-312.pyc", "cache")
+        self.write("legacy.pyc", "cache")
+        code, out = self.ctl("gate")
+        self.assertEqual(code, 0, out)
+
+    def test_the_tools_leave_no_cache_files_behind(self) -> None:
+        tools = self.repo / "tools" / "governance"
+        tools.mkdir(parents=True)
+        for name in ("stagectl", "verifyctl"):
+            shutil.copy2(STAGECTL.with_name(name), tools / name)
+        result = subprocess.run([sys.executable, str(tools / "stagectl"), "--repo", str(self.repo), "--json", "gate"],
+                                capture_output=True, text=True, check=False)
+        self.assertIn(result.returncode, (0, 3), result.stderr)
+        self.assertFalse((tools / "__pycache__").exists())
+
     def test_gate_rerun_catches_a_receipt_whose_checks_do_not_pass_here(self) -> None:
         receipt = self.proven()
         self.assertEqual(self.ctl("gate", "--rerun")[0], 0)

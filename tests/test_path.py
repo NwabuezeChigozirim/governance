@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -201,6 +202,42 @@ class WhereTests(unittest.TestCase):
         report = self.where([SPEC], [{"number": 21, "title": "x", "branch": "b"}])
         self.assertEqual(report["step"], 5)
         self.assertIn("Totals slice", report["state"])
+
+    @unittest.skipIf(os.name == "nt", "builds a PATH with a fake gh script")
+    def test_github_is_read_page_by_page_with_any_gh_and_a_failure_is_named(self) -> None:
+        self.git("remote", "add", "origin", "https://github.com/owner/project.git")
+        bin_dir = self.repo.parent / (self.repo.name + "-bin")
+        bin_dir.mkdir()
+        self.addCleanup(shutil.rmtree, bin_dir, True)
+        log = bin_dir / "calls.log"
+        fake = bin_dir / "gh"
+        fake.write_text(f"""#!{sys.executable}
+import json, sys, re
+args = sys.argv[1:]
+open({str(log)!r}, "a").write(" ".join(args) + "\\n")
+if "--slurp" in args or "--paginate" in args:
+    sys.stderr.write("unknown flag\\n"); sys.exit(1)
+if {str(bin_dir / "fail")!r} and __import__("os").path.exists({str(bin_dir / "fail")!r}):
+    sys.stderr.write("HTTP 401: Bad credentials\\n"); sys.exit(1)
+path = args[1]
+page = int(re.search(r"[?&]page=(\\d+)", path).group(1))
+if "/issues?" in path:
+    count = 100 if page == 1 else 1 if page == 2 else 0
+    print(json.dumps([{{"number": page * 1000 + n, "title": "x", "body": "", "state": "closed", "labels": []}} for n in range(count)]))
+else:
+    print("[]")
+""", encoding="utf-8")
+        fake.chmod(0o755)
+        env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+        run = lambda: json.loads(subprocess.run([sys.executable, "-B", str(WHERE), "--repo", str(self.repo), "--json"],
+                                                capture_output=True, text=True, check=True, env=env).stdout)
+        report = run()
+        self.assertNotIn("could not be read", report["state"])
+        self.assertIn("page=2", log.read_text())
+        (bin_dir / "fail").write_text("", encoding="utf-8")
+        report = run()
+        self.assertIn("could not be read", report["state"])
+        self.assertIn("Bad credentials", report["state"])
 
     def test_the_plain_report_is_three_lines_a_person_can_read(self) -> None:
         result = subprocess.run([sys.executable, "-B", str(WHERE), "--repo", str(self.repo), "--tracker-file", "/nonexistent"],
