@@ -24,6 +24,7 @@ deny. No objection prints {} and leaves Cursor's own permission checks in place.
 
 from __future__ import annotations
 
+import hashlib
 from importlib.machinery import SourceFileLoader
 import importlib.util
 import json
@@ -76,12 +77,28 @@ def unproven_changes(stagectl, root: Path) -> list[str]:
     if not settings["require_stage"]:
         return []
     listing = stagectl.git(root, "status", "--porcelain", "--untracked-files=all")
-    changed = sorted({line[3:].split(" -> ")[-1].strip('"') for line in listing.splitlines() if len(line) > 3})
+    changed = sorted({parts[1].split(" -> ")[-1].strip('"') for parts in
+                      (line.strip().split(None, 1) for line in listing.splitlines()) if len(parts) == 2})
     changed = [name for name in changed if not stagectl.exempt(root, name, settings)]
     if not changed:
         return []
     tree = stagectl.governed_tree(root)
     return [] if any(item["tree"] == tree for item in stagectl.receipts(root)) else changed
+
+
+def already_reported(stagectl, root: Path, changed: list[str]) -> bool:
+    """Whether these exact changes were reported before. The same files with the same content are
+    reported once, so an edit the owner made is not raised again on every turn."""
+    state = hashlib.sha256()
+    for name in changed:
+        path = root / name
+        state.update(name.encode() + b"\0" + (path.read_bytes() if path.is_file() else b"") + b"\0")
+    record = stagectl.pointer_path(root).with_name(stagectl.pointer_path(root).stem + ".reported.json")
+    previous = stagectl.read_json(record)
+    if isinstance(previous, dict) and previous.get("sha256") == state.hexdigest():
+        return True
+    stagectl.write_json(record, {"sha256": state.hexdigest()})
+    return False
 
 
 def approved_outputs(stagectl, root: Path) -> set[str]:
@@ -177,7 +194,7 @@ def stop(payload: dict) -> dict[str, str]:
         return {}
     if not stagectl.pointer_path(root).is_file():
         changed = unproven_changes(stagectl, root)
-        if not changed:
+        if not changed or already_reported(stagectl, root, changed):
             return {}
         shown = ", ".join(changed[:8]) + (f" and {len(changed) - 8} more" if len(changed) > 8 else "")
         return {"followup_message": f"This project requires a stage, and these files changed without one: {shown}. "

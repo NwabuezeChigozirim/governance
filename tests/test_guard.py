@@ -232,6 +232,32 @@ class GuardTests(unittest.TestCase):
         self.assertIn("app.py", message)
         self.assertNotIn("guide.md", message)
 
+    def test_stop_names_a_changed_file_in_full_and_honours_exemptions_for_the_first_one(self) -> None:
+        self.require_stage(exempt=["GLOSSARY.md"])
+        (self.repo / "AGENTS.md").write_text("# guide\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "AGENTS.md"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                        "commit", "-q", "-m", "guide"], check=True)
+        (self.repo / "AGENTS.md").write_text("# guide\n\nmore\n", encoding="utf-8")
+        message = self.hook("stop", {})["followup_message"]
+        self.assertIn(" AGENTS.md.", message)
+        self.assertNotIn(" GENTS.md", message)
+        subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", "AGENTS.md"], check=True)
+        (self.repo / "GLOSSARY.md").write_text("# words\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "GLOSSARY.md"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                        "commit", "-q", "-m", "words"], check=True)
+        (self.repo / "GLOSSARY.md").write_text("# words\n\nreport\n", encoding="utf-8")
+        self.assertEqual(self.hook("stop", {}), {})
+
+    def test_stop_reports_the_same_unproven_change_once(self) -> None:
+        self.require_stage()
+        (self.repo / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        self.assertIn("followup_message", self.hook("stop", {}))
+        self.assertEqual(self.hook("stop", {}), {})
+        (self.repo / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        self.assertIn("followup_message", self.hook("stop", {}))
+
     def test_stop_is_quiet_after_a_stage_closed_on_the_current_code(self) -> None:
         self.require_stage()
         (self.repo / "app.py").write_text("print(1)\n", encoding="utf-8")
