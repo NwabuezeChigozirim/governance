@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 from pathlib import Path
 import re
 import shlex
@@ -61,6 +62,8 @@ def record(stagectl, root: Path, payload: dict[str, Any]) -> bool:
 def tokens(command: str) -> list[str]:
     if any(mark in command for mark in ("`", "$", "\n", "\r")):
         raise Refused("run the approval command on its own, with no substitution")
+    if os.name == "nt":
+        command = command.replace("\\", "/")
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     try:
