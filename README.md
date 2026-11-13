@@ -51,6 +51,14 @@ baseline is recorded once the tools are there. An existing linter config is used
 is, not replaced.
 
 It never overwrites a file that exists, apart from refreshing `tools/governance/`.
+
+Adopting an empty project gives it only R-001 and R-002, because there is no language
+to choose a preset for. Run `adopt.py` again once the project has source files: it adds
+the strict rules for the languages it now finds, their bad examples, their rows in
+`AGENTS.md` and the linter install step in the workflow, and records today's findings
+for those new rules only. Violations of a rule that was already there are never forgiven
+by running it again.
+
 Commit the result to the main branch directly (its own pull request has no receipt
 yet), then make the `gate` job a required check. Only then is the gate a merge gate.
 

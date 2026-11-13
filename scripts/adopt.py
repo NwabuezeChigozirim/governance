@@ -17,7 +17,8 @@ It adds, and never overwrites an existing file except its own copied tools:
   .github/workflows/governance.yml   runs the rules and the stage gate on every pull request
   .gitignore                         ignores .verify/ (evidence stays out of the code fingerprint)
 
-Run it again after updating the plugin to refresh tools/governance/. Standard library only.
+Run it again after updating the plugin to refresh tools/governance/, or after the project gains
+a language: the strict rules for that language are added then. Standard library only.
 """
 
 from __future__ import annotations
@@ -173,6 +174,94 @@ def create(path: Path, text: str, done: list[str]) -> bool:
     return True
 
 
+def upgrade(path: Path, globs: list[str], chosen: list[str],
+            done: list[str]) -> tuple[list[tuple[str, str, str, str]], dict[str, str], dict[str, list[str]]]:
+    """Bring an adopted project's rules up to the languages it has now. Returns the new table rows,
+    the new bad examples and, for each rule added or widened, the file endings it newly covers
+    (empty for a new rule, which covers everything it finds)."""
+    config = json.loads(path.read_text(encoding="utf-8"))
+    rules = config.setdefault("rules", [])
+    changed: dict[str, list[str]] = {}
+    for rule in rules:
+        missing = [glob for glob in globs if glob not in rule.get("include", [])]
+        if missing and rule.get("id") in ("R-001", "R-002") and rule.get("kind") in ("ban-comments", "max-lines"):
+            rule["include"] = [*rule.get("include", []), *missing]
+            changed[rule["id"]] = [glob.rsplit("*", 1)[-1] for glob in missing]
+    have = {word for rule in rules for word in rule.get("argv", []) if word in PRESETS}
+    numbers = [int(str(rule.get("id", ""))[2:]) for rule in rules if str(rule.get("id", ""))[2:].isdigit()]
+    rows, examples = [], {}
+    for name in chosen:
+        if name in have:
+            continue
+        preset = PRESETS[name]
+        numbers.append(max(numbers, default=0) + 1)
+        rule_id = f"R-{numbers[-1]:03d}"
+        bad = f".governance/bad/{rule_id}.{preset['ext']}"
+        rules.append({"id": rule_id, **preset["entry"]})
+        rows.append((rule_id, preset["rule"], preset["level"], bad))
+        examples[bad] = preset["bad"]
+        changed[rule_id] = []
+    if changed:
+        path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8", newline="\n")
+        done.append(f"updated  {path} ({', '.join(sorted(changed))} now cover the languages in this project)")
+    return rows, examples, changed
+
+
+def rebaseline(repo: Path, tools: Path, changed: dict[str, list[str]], done: list[str]) -> str:
+    """Record today's violations. On a project that has a baseline, only the rules in `changed` may add to it."""
+    path = repo / ".governance" / "baseline.json"
+    previous = json.loads(path.read_text(encoding="utf-8")).get("counts", {}) if path.exists() else None
+    argv = [sys.executable, "-B", str(tools / "rulekit"), "--repo", str(repo), "baseline"]
+    result = subprocess.run(argv + ([] if previous is None else ["--owner-approved"]),
+                            capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return result.stderr.strip() or result.stdout.strip()
+    if previous is None:
+        done.append(f"created  {path}")
+        return ""
+    value = json.loads(path.read_text(encoding="utf-8"))
+    for rule, files in list(value["counts"].items()):
+        if rule in changed and not changed[rule]:
+            continue
+        endings = tuple(changed.get(rule, []))
+        kept = {name: count if endings and name.endswith(endings) else min(count, previous.get(rule, {}).get(name, 0))
+                for name, count in files.items()}
+        value["counts"][rule] = {name: count for name, count in kept.items() if count}
+        if not value["counts"][rule]:
+            del value["counts"][rule]
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    done.append(f"updated  {path} (today's violations of {', '.join(sorted(changed))})")
+    return ""
+
+
+def add_rows(agents: Path, text: str, rows: list[tuple[str, str, str, str]], done: list[str]) -> None:
+    lines = text.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.strip().lower() == "## rules")
+    end = next((index for index in range(start + 1, len(lines)) if lines[index].startswith("## ")), len(lines))
+    table = [index for index in range(start, end) if lines[index].startswith("|")]
+    rows = [row for row in rows if not any(line.startswith(f"| {row[0]} ") for line in lines)]
+    if not rows:
+        done.append("kept     AGENTS.md (it already has a Rules section)")
+        return
+    if not table:
+        done.append(f"NOT DONE AGENTS.md has a Rules section with no table; add rows for {', '.join(r[0] for r in rows)}")
+        return
+    added = [ROW.format(id=i, rule=r, level=l, bad=b).rstrip("\n") for i, r, l, b in rows]
+    lines[table[-1] + 1:table[-1] + 1] = added
+    agents.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    done.append(f"added    {', '.join(row[0] for row in rows)} to the Rules table in {agents}")
+
+
+def add_setup(workflow: Path, parts: list[str], done: list[str]) -> None:
+    text = workflow.read_text(encoding="utf-8")
+    marker = "      - name: Rules hold\n"
+    missing = [part for part in parts if part.splitlines()[0] not in text]
+    if not missing or marker not in text:
+        return
+    workflow.write_text(text.replace(marker, "".join(missing) + marker, 1), encoding="utf-8", newline="\n")
+    done.append(f"updated  {workflow} (it now installs the linters the rules need)")
+
+
 def adopt(repo: Path) -> list[str]:
     done: list[str] = []
     files = tracked_files(repo)
@@ -218,32 +307,32 @@ def adopt(repo: Path) -> list[str]:
         rules.append({"id": rule_id, **preset["entry"]})
         rows.append((rule_id, preset["rule"], preset["level"], bad))
         examples[bad] = preset["bad"]
-    fresh = create(governance / "config.json", json.dumps({"version": 1, "require_stage": True, "exempt": list(PLANNING_DOCS), "protected": []}, indent=2) + "\n", done)
+    create(governance / "config.json", json.dumps({"version": 1, "require_stage": True, "exempt": list(PLANNING_DOCS), "protected": []}, indent=2) + "\n", done)
     fresh = create(governance / "rules.json", json.dumps(
         {"version": 1, "exclude": ["tools/governance/**"], "rules": rules}, indent=2) + "\n", done)
-    if fresh:
-        for bad, text in examples.items():
+    changed: dict[str, list[str]] = {}
+    if not fresh:
+        rows, examples, changed = upgrade(governance / "rules.json", globs if present else [], chosen, done)
+    for bad, text in examples.items():
+        if fresh or not (repo / bad).exists():
             create(repo / bad, text, done)
     pending = ""
-    if not (governance / "baseline.json").exists():
-        result = subprocess.run([sys.executable, "-B", str(tools / "rulekit"), "--repo", str(repo), "baseline"],
-                                capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            done.append(f"created  {governance / 'baseline.json'}")
-        else:
-            pending = result.stderr.strip() or result.stdout.strip()
+    if changed or not (governance / "baseline.json").exists():
+        pending = rebaseline(repo, tools, changed, done)
 
     agents = repo / "AGENTS.md"
     text = agents.read_text(encoding="utf-8") if agents.exists() else "# Agent guide\n"
     if any(line.strip().lower() == "## rules" for line in text.splitlines()):
-        done.append("kept     AGENTS.md (it already has a Rules section)")
+        add_rows(agents, text, rows if not fresh else [], done)
     else:
         table = RULES_SECTION + "".join(ROW.format(id=i, rule=r, level=l, bad=b) for i, r, l, b in rows)
         agents.write_text(text.rstrip("\n") + "\n" + table, encoding="utf-8", newline="\n")
         done.append(f"added    a Rules table to {agents}")
 
     setup = (PYTHON_SETUP if "py" in present else "") + (NODE_SETUP if node else "")
-    create(repo / ".github" / "workflows" / "governance.yml", WORKFLOW.format(setup=setup), done)
+    workflow = repo / ".github" / "workflows" / "governance.yml"
+    if not create(workflow, WORKFLOW.format(setup=setup), done):
+        add_setup(workflow, [part for part in ((PYTHON_SETUP if "py" in present else ""), (NODE_SETUP if node else "")) if part], done)
     ignore = repo / ".gitignore"
     lines = ignore.read_text(encoding="utf-8").splitlines() if ignore.exists() else []
     if ".verify/" not in lines:
@@ -253,7 +342,8 @@ def adopt(repo: Path) -> list[str]:
         done.append(f"\nNOT DONE the baseline could not be recorded: {pending}")
         if node:
             done.append(f"         for a JavaScript or TypeScript project, first run: {ESLINT_INSTALL}")
-        done.append("         install what is missing, then run: python tools/governance/rulekit baseline")
+        approval = " --owner-approved" if (governance / "baseline.json").exists() else ""
+        done.append(f"         install what is missing, then run: python tools/governance/rulekit baseline{approval}")
     return done
 
 
