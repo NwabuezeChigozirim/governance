@@ -6,6 +6,9 @@ disable-model-invocation: true
 
 # Approve
 
+
+When this runs as part of the owner's path from idea to merged code, follow [STEPS.md](../start/STEPS.md): open each message with the step line, say what is happening in plain words, and close with what the owner must do and what comes next.
+
 The owner typed `/approve`. That message is the approval: the plugin's hook saw it come from the owner and unlocked one approval command for this conversation, for about fifteen minutes. Nothing you write can create that unlock, so never tell the owner it is done until the command below has actually succeeded.
 
 `stagectl` and `rulekit` are at `../../scripts/` from this file, and at `tools/governance/` in an adopted project.

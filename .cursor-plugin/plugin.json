@@ -1,10 +1,11 @@
 {
-	"name": "governance",
-	"displayName": "governance",
-	"version": "3.0.0-alpha.12",
-	"description": "An environment that makes agents prove their work: verification skills, sealed evidence, and enforced rules.",
+	"name": "trust",
+	"displayName": "trust",
+	"version": "4.0.0-alpha.1",
+	"description": "One path from an idea to merged code you can trust: an interview, a stack, a spec, tickets, then each ticket built under enforced rules and proven before it merges.",
 	"license": "MIT",
 	"keywords": [
+		"planning",
 		"verification",
 		"governance",
 		"evidence",

@@ -6,7 +6,10 @@ disable-model-invocation: true
 
 # Adopt
 
-Adoption is the owner's decision to constrain a project. Run this only because the owner typed `/adopt`. Never start it yourself, and never suggest running the script as a way past a blocked edit.
+
+When this runs as part of the owner's path from idea to merged code, follow [STEPS.md](../start/STEPS.md): open each message with the step line, say what is happening in plain words, and close with what the owner must do and what comes next.
+
+Adoption is the owner's decision to constrain a project. Run this because the owner typed `/adopt`, or because the owner typed `/next` or `/start` and the path has reached building in a project that is not adopted or lacks the strict rules for its language. Never start it for any other reason, and never suggest running the script as a way past a blocked edit.
 
 The script is at `../../scripts/adopt.py` from this file. It only adds: it never overwrites the owner's config, rules or linter settings, and running it again never forgives a violation of a rule that was already there.
 
