@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Cursor hook guard for governed work.
 
+before-submit-prompt
+  When the owner's own message is /approve, record a one-time grant (hooks/approval.py).
 pre-tool-use
-  Always: an agent cannot record owner approval, and cannot touch stage state or
-  write a stage receipt by hand.
+  Always: an agent cannot record owner approval unless the owner granted it by typing
+  /approve, and cannot touch stage state or write a stage receipt by hand.
   While a stage is active in this worktree: destructive or unclassified Git commands
   are blocked for owner review.
   In a project whose .governance/config.json sets require_stage: file edits are
@@ -33,6 +35,7 @@ import sys
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import approval  # noqa: E402
 import hook_policy  # noqa: E402
 
 APPROVAL = re.compile(r"\b(stagectl|rulekit)\b.*--owner-approved|--owner-approved.*\b(stagectl|rulekit)\b", re.DOTALL)
@@ -48,7 +51,8 @@ def load_stagectl():
 
 
 def worktree(stagectl, payload: dict) -> Path | None:
-    for candidate in (os.environ.get("CURSOR_PROJECT_DIR"), payload.get("cwd"), os.getcwd()):
+    roots = payload.get("workspace_roots") if isinstance(payload.get("workspace_roots"), list) else []
+    for candidate in (os.environ.get("CURSOR_PROJECT_DIR"), payload.get("cwd"), *roots, os.getcwd()):
         if candidate:
             try:
                 return stagectl.worktree_root(candidate)
@@ -93,11 +97,39 @@ def deny(reason: str) -> dict[str, str]:
     return {"permission": "deny", "user_message": reason, "agent_message": reason}
 
 
+def approve(payload: dict, command: str) -> dict[str, str]:
+    """Let an approval command through only on a grant the owner gave by typing /approve."""
+    reason = "the owner has not approved anything"
+    try:
+        stagectl = load_stagectl()
+        root = worktree(stagectl, payload)
+        if root is not None:
+            approval.permit(stagectl, root, payload, command)
+            return {}
+    except approval.Refused as exc:
+        reason = str(exc)
+    except Exception:
+        reason = "the approval could not be checked"
+    return deny(f"Governance: only the owner records approval, and {reason}. Show the owner what needs approving "
+                "and ask them to type /approve (or /approve baseline), then run this exact command once. "
+                "Do not retry it before they do.")
+
+
+def before_submit_prompt(payload: dict) -> dict[str, bool]:
+    try:
+        stagectl = load_stagectl()
+        root = worktree(stagectl, payload)
+        if root is not None:
+            approval.record(stagectl, root, payload)
+    except Exception:
+        pass
+    return {"continue": True}
+
+
 def pre_tool_use(payload: dict) -> dict[str, str]:
     command, target = hook_policy.action(payload)
     if command and APPROVAL.search(command):
-        return deny("Governance: only the owner records approval. Show the owner the contract and ask them to run "
-                    "this command themselves; do not retry it.")
+        return approve(payload, command)
     if (command and STATE in command and "stagectl" not in command) or (target and STATE in Path(target).parts):
         return deny("Governance: stage records are written only by stagectl. Do not read around or edit them.")
     if not command and not target:
@@ -169,7 +201,8 @@ def main() -> int:
         payload = json.loads(raw.decode("utf-8")) if raw.strip() else {}
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
-        result = pre_tool_use(payload) if event == "pre-tool-use" else stop(payload) if event == "stop" else {}
+        handlers = {"pre-tool-use": pre_tool_use, "stop": stop, "before-submit-prompt": before_submit_prompt}
+        result = handlers[event](payload) if event in handlers else {}
     except Exception:
         # A broken guard must not silently let an approval through, and must not
         # block every tool in every project either.

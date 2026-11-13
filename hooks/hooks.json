@@ -1,6 +1,12 @@
 {
   "version": 1,
   "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "command": "python3 ${CURSOR_PLUGIN_ROOT}/hooks/guard.py before-submit-prompt",
+        "timeout": 10
+      }
+    ],
     "preToolUse": [
       {
         "command": "python3 ${CURSOR_PLUGIN_ROOT}/hooks/guard.py pre-tool-use",

@@ -49,7 +49,7 @@ If cost is the worry, say where the tokens go: subagents, review panels, and ver
 Every playbook that ships a change runs inside a stage (the [`stage`](../stage/SKILL.md) skill):
 
 1. The agent writes a contract under `.governance/stages/`: the intent, the acceptance list, and the commands that prove it.
-2. The owner reads it and runs the freeze command themselves. This is the one approval. The agent cannot run it.
+2. The owner reads it and types `/approve`. This is the one approval. The agent then runs the freeze; the hook lets it through once, for the contract as the owner saw it, and blocks it otherwise.
 3. The agent works, runs the checks, and gets an independent verdict when the contract asks for one.
 4. `stagectl close` writes a receipt naming the exact code. The CI gate passes only when a receipt matches the pull request.
 
@@ -104,6 +104,7 @@ The user does not need to know what good code is. Three things carry it:
 
 | The user wants to | Use |
 |---|---|
+| Approve a stage contract the agent just showed, or a larger baseline | [`/approve`](../approve/SKILL.md), or `/approve baseline` |
 | Stop a mistake they just corrected from happening again | [`/correct`](../correct/SKILL.md) |
 | Add one enforced rule fast: ban comments, an import, a pattern, cap file length, fix the folder layout | [`/rulekit`](../rulekit/SKILL.md) |
 | Find the bad habits that are spreading, before being asked | [`/garden`](../garden/SKILL.md) |
@@ -132,7 +133,8 @@ Principles are one-rule skills that `/govern` reads and cites. The user steers w
 | Symptom | Fix |
 |---|---|
 | "This project requires a stage before files change" | Working as designed. The agent writes the contract and the owner freezes it. For files that should never need a stage, the owner adds a glob to `exempt` in `.governance/config.json`. |
-| The agent asks the owner to run a command with `--owner-approved` | Working as designed. Read the contract it shows, then run the command. |
+| The agent asks the owner to type `/approve` | Working as designed. Read the contract it shows, then type it. |
+| The agent says the hook saw no approval after `/approve` | Cursor did not pass the message to the hook. Run the `--owner-approved` command it gives you in a terminal, and report it as a plugin bug. |
 | "sets how strict the checks are" | The agent tried to edit a linter config or the rule file. If that really is the task, the contract must list the file in `outputs`. |
 | `rulekit check` exits 127 | A linter is not installed. Install the tool the message names. Do not remove the rule. |
 | The CI `gate` job fails | No receipt matches the pull request's code. Something changed after `stagectl close`. Rerun the checks, close again, commit the new receipt. |

@@ -45,13 +45,13 @@ Write the contract to `.governance/stages/<short-name>.json`. That directory is 
 
 ## 3. Get approval and freeze
 
-Show the owner the intent, the acceptance list and the check commands. This is the one approval in the stage. Ask them to run this themselves:
+Show the owner the intent, the acceptance list and the check commands. This is the one approval in the stage. Ask them to type `/approve`. When they have, run this once, by itself (the **approve** skill):
 
 ```bash
 stagectl --repo . freeze --contract .governance/stages/<short-name>.json --owner-approved
 ```
 
-You do not run it. Only the owner records approval, and the plugin's hook blocks an agent that tries. The same holds for `revise`.
+Do not run it before the owner types `/approve`, and do not change the contract between their approval and the freeze: the hook allows this command only once, only for the contract as the owner saw it. The same holds for `revise`. If the hook says it saw no approval, give the owner the command to run in a terminal themselves.
 
 ## 4. Do the work, then prove it
 
@@ -84,7 +84,7 @@ Report the stage ID and the receipt path.
 
 ## When the agreement changes
 
-- A frozen input changed, or the intent, acceptance or checks must change: update the contract file, get the owner's approval for the new version, then `stagectl revise --contract .governance/stages/<short-name>.json --owner-approved --reason "..."`. All checks start over.
+- A frozen input changed, or the intent, acceptance or checks must change: update the contract file, show the owner the new version, ask them to type `/approve`, then run `stagectl revise --contract .governance/stages/<short-name>.json --owner-approved --reason "..."`. All checks start over.
 - The work is abandoned: `stagectl cancel --reason "..."`. Cancellation is never completion.
 
 Exit codes: 0 ok, 2 invalid invocation or no active stage, 3 checks failed or stale, 4 owner approval needed.

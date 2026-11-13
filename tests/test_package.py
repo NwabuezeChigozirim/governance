@@ -59,7 +59,7 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn("poteto-mode", path.read_text(encoding="utf-8"), path)
 
     def test_what_only_the_owner_starts_is_never_loaded_by_an_agent(self) -> None:
-        for name in ("adopt", "setup-pstack", "govern", "stage", "correct", "garden"):
+        for name in ("adopt", "approve", "setup-pstack", "govern", "stage", "correct", "garden"):
             text = (SKILLS / name / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("disable-model-invocation: true", text.split("\n---\n", 1)[0], name)
         adopt = (SKILLS / "adopt" / "SKILL.md").read_text(encoding="utf-8")

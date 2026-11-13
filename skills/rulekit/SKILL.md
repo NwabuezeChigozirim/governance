@@ -54,7 +54,7 @@ In an adopted project the tools are at `tools/governance/`. Run them as `python 
 
 ## Limits you must respect
 
-- The baseline only shrinks. If `baseline` refuses because a count would grow, fix the new violation. Growing it takes the owner running `rulekit baseline --owner-approved`; the hook blocks you from running that.
+- The baseline only shrinks. If `baseline` refuses because a count would grow, fix the new violation. Growing it takes the owner's approval: say which rules and files would grow and why, ask them to type `/approve baseline`, then run `rulekit --repo . baseline --owner-approved` once (the **approve** skill). The hook blocks it otherwise.
 - Never widen `allow`, narrow `include`, add to `exclude`, or loosen a `pattern` to make a failure go away. A rule change is its own stage, with the owner approving the contract.
 - A `linter` rule is only as strict as the tool's config file (`ruff.toml`, `eslint.config.mjs`, `tsconfig.json`). The hook blocks edits to those files, to `.governance/rules.json` and to the governance workflow unless the frozen contract lists the file in `outputs`, and blocks hand edits to the baseline always. Never relax a config, add a suppression comment, or cast a type away to get past a finding. Exit 127 means the tool is not installed: install it, do not remove the rule.
 - `ban-comments` understands Python and C-style languages. `ban-import` resolves relative imports and Python modules; path aliases need `forbid_specifiers`. Say so when a rule depends on something it cannot see.

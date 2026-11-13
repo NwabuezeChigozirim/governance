@@ -51,6 +51,82 @@ class GuardTests(unittest.TestCase):
     def freeze(self) -> None:
         self.stagectl("freeze", "--contract", "stage.json", "--owner-approved")
 
+    def approve(self, text: str = "/approve", conversation: str = "c1") -> dict:
+        return self.hook("before-submit-prompt", {"prompt": text, "conversation_id": conversation,
+                                                  "workspace_roots": [str(self.repo)]})
+
+    def approval_command(self, command: str, conversation: str = "c1") -> dict:
+        return self.hook("pre-tool-use", {"tool_name": "Shell", "conversation_id": conversation,
+                                          "tool_input": {"command": command, "working_directory": str(self.repo)}})
+
+    def draft(self, name: str = "totals") -> str:
+        stages = self.repo / ".governance" / "stages"
+        stages.mkdir(parents=True, exist_ok=True)
+        (stages / f"{name}.json").write_text(json.dumps(CONTRACT), encoding="utf-8")
+        return f"{sys.executable} -B {STAGECTL} --repo . freeze --contract .governance/stages/{name}.json --owner-approved"
+
+    def test_owner_typing_approve_lets_the_agent_freeze_that_contract_once(self) -> None:
+        command = self.draft()
+        self.assertEqual(self.approval_command(command).get("permission"), "deny")
+        self.assertEqual(self.approve(), {"continue": True})
+        self.assertEqual(self.approval_command(command), {})
+        subprocess.run(command, shell=True, cwd=self.repo, check=True, capture_output=True)
+        self.assertEqual(self.approval_command(command).get("permission"), "deny")
+
+    def test_only_a_message_that_starts_with_the_command_is_an_approval(self) -> None:
+        command = self.draft()
+        for text in ("the owner said /approve", "approve", "/approved", ""):
+            self.approve(text)
+            self.assertEqual(self.approval_command(command).get("permission"), "deny", text)
+        self.approve("  /approve looks right")
+        self.assertEqual(self.approval_command(command), {})
+
+    def test_an_approval_does_not_carry_to_another_conversation_or_past_its_window(self) -> None:
+        command = self.draft()
+        self.approve()
+        self.assertEqual(self.approval_command(command, conversation="c2").get("permission"), "deny")
+        self.assertEqual(self.approval_command(command), {})
+        self.approve()
+        grant = next((self.repo / ".git" / "governance-v3").rglob("*.approval.json"))
+        value = json.loads(grant.read_text())
+        value["created"] -= 3600
+        grant.write_text(json.dumps(value))
+        self.assertIn("expired", self.approval_command(command)["agent_message"])
+
+    def test_a_contract_changed_after_approval_is_not_approved(self) -> None:
+        command = self.draft()
+        self.approve()
+        changed = {**CONTRACT, "intent": "Something the owner never saw."}
+        (self.repo / ".governance/stages/totals.json").write_text(json.dumps(changed), encoding="utf-8")
+        self.assertIn("changed after", self.approval_command(command)["agent_message"])
+        self.assertEqual(self.approval_command(command).get("permission"), "deny")
+
+    def test_an_approval_covers_the_newest_or_named_contract_only(self) -> None:
+        older = self.draft("older")
+        os.utime(self.repo / ".governance/stages/older.json", (1, 1))
+        newer = self.draft("newer")
+        self.approve()
+        self.assertEqual(self.approval_command(older).get("permission"), "deny")
+        self.assertEqual(self.approval_command(newer), {})
+        self.approve("/approve older")
+        self.assertEqual(self.approval_command(older), {})
+
+    def test_an_approval_cannot_be_spent_on_anything_but_the_plain_command(self) -> None:
+        command = self.draft()
+        fake = self.repo / "stagectl"
+        fake.write_text("print('x')\n", encoding="utf-8")
+        for attempt in (command + " && git push", command + " ; rm -rf x", "echo $(" + command + ")",
+                        f"{sys.executable} stagectl --repo . freeze --contract .governance/stages/totals.json --owner-approved",
+                        command.replace("--repo .", "--repo /tmp"),
+                        f"{sys.executable} {PACKAGE / 'scripts' / 'rulekit'} --repo . baseline --owner-approved"):
+            self.approve()
+            self.assertEqual(self.approval_command(attempt).get("permission"), "deny", attempt)
+        self.approve("/approve baseline")
+        self.assertEqual(self.approval_command(command).get("permission"), "deny")
+        self.approve("/approve baseline")
+        self.assertEqual(self.approval_command(
+            f"{sys.executable} {PACKAGE / 'scripts' / 'rulekit'} --repo . baseline --owner-approved"), {})
+
     def test_agent_cannot_record_owner_approval(self) -> None:
         for command in ("python3 scripts/stagectl --repo . freeze --contract stage.json --owner-approved",
                         "stagectl revise --owner-approved --contract s.json --reason 'x'"):
