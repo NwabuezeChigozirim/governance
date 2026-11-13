@@ -31,7 +31,7 @@ import subprocess
 import sys
 
 SOURCE = Path(__file__).resolve().parent
-TOOLS = ("stagectl", "verifyctl", "rulectl", "rulekit")
+TOOLS = ("stagectl", "verifyctl", "rulectl", "rulekit", "where")
 LANGUAGES = {".py": "py", ".ts": "ts", ".tsx": "ts", ".js": "js", ".jsx": "js", ".mjs": "js", ".go": "go",
              ".rs": "rs", ".java": "java", ".kt": "kt", ".cs": "cs", ".swift": "swift", ".dart": "dart"}
 BAD = {"py": "# Retry because the first call sometimes fails.\nVALUE = 1\n"}

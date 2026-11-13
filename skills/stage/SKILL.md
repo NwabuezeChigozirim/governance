@@ -6,6 +6,9 @@ disable-model-invocation: true
 
 # Stage
 
+
+When this runs as part of the owner's path from idea to merged code, follow [STEPS.md](../start/STEPS.md): open each message with the step line, say what is happening in plain words, and close with what the owner must do and what comes next.
+
 A stage is one reviewable unit of work in one worktree. The owner approves its intent and checks once, at the start. After that nothing waits on the owner: the stage closes itself when every check has passed on the final code.
 
 `stagectl` is at `../../scripts/stagectl` from this file, and at `tools/governance/stagectl` in a project that ran the plugin's `adopt.py`. Run it as `python3 <path>/stagectl --repo . <command>`.

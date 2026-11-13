@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Say where a project is on the six-step path, from its real state.
+
+    where --repo .            one short report for a person
+    where --repo . --json     the same facts for an agent
+
+The steps: 1 Describe, 2 Choose the stack, 3 Spec, 4 Tickets, 5 Build, 6 Merge.
+It reads the repository, the stage state and, through `gh`, the issues and pull
+requests. It changes nothing. Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+from importlib.machinery import SourceFileLoader
+import importlib.util
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+from typing import Any
+
+HERE = Path(__file__).resolve().parent
+STEPS = {1: "Describe", 2: "Choose the stack", 3: "Spec", 4: "Tickets", 5: "Build", 6: "Merge"}
+CODE = {".py": "Python", ".ts": "TypeScript", ".tsx": "TypeScript", ".js": "JavaScript", ".jsx": "JavaScript",
+        ".go": "Go", ".rs": "Rust", ".java": "Java", ".kt": "Kotlin", ".cs": "C#", ".swift": "Swift", ".dart": "Dart"}
+STRICT = {"Python", "TypeScript", "JavaScript"}
+NOT_PRODUCT = ("tools/governance/", ".governance/", ".scratch/", "docs/")
+
+
+def load_stagectl():
+    loader = SourceFileLoader("stagectl", str(HERE / "stagectl"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("stagectl", loader))
+    loader.exec_module(module)
+    return module
+
+
+def run(argv: list[str], cwd: Path) -> str | None:
+    try:
+        result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def slug(root: Path) -> str | None:
+    remote = run(["git", "remote", "get-url", "origin"], root)
+    match = re.search(r"github\.com[:/]+([^/\s]+/[^/\s]+?)(?:\.git)?\s*$", remote or "")
+    return match.group(1) if match else None
+
+
+def tracker(root: Path) -> dict[str, Any] | None:
+    """Issues and open pull requests from GitHub's REST API, or None when `gh` cannot reach them."""
+    repo = slug(root)
+    if repo is None:
+        return None
+    issues = run(["gh", "api", "--paginate", "--slurp", f"repos/{repo}/issues?state=all&per_page=100"], root)
+    pulls = run(["gh", "api", f"repos/{repo}/pulls?state=open&per_page=100"], root)
+    if issues is None or pulls is None:
+        return None
+    found = [issue for page in json.loads(issues) for issue in page if "pull_request" not in issue]
+    for issue in found:
+        issue["blocked_by"] = []
+        if issue["state"] == "open" and "## Acceptance criteria" in (issue.get("body") or ""):
+            listing = run(["gh", "api", f"repos/{repo}/issues/{issue['number']}/dependencies/blocked_by",
+                           "--jq", "[.[] | select(.state == \"open\") | .number]"], root)
+            issue["blocked_by"] = json.loads(listing) if listing else []
+    return {"issues": found, "pulls": [{"number": pull["number"], "title": pull["title"], "branch": pull["head"]["ref"]}
+                                       for pull in json.loads(pulls)]}
+
+
+def local(root: Path, stagectl) -> dict[str, Any]:
+    files = stagectl.git(root, "ls-files", "-co", "--exclude-standard").splitlines()
+    languages = sorted({CODE[Path(name).suffix] for name in files
+                        if Path(name).suffix in CODE and not name.startswith(NOT_PRODUCT)})
+    records = sorted((root / "docs" / "adr").glob("*.md")) if (root / "docs" / "adr").is_dir() else []
+    stack = next((path.relative_to(root).as_posix() for path in records
+                  if re.search(r"technology stack", path.read_text(encoding="utf-8").split("\n", 1)[0], re.IGNORECASE)), None)
+    rules = stagectl.read_json(root / stagectl.RULES) or {}
+    linted = any(rule.get("kind") == "linter" for rule in rules.get("rules", []))
+    stage = None
+    if stagectl.pointer_path(root).is_file():
+        report = stagectl.inspect(root)
+        stage = {"name": report["name"], "ready": report["ready"],
+                 "unproven": [problem["message"] for problem in report["problems"][:5]]}
+    return {"planning_set_up": (root / "docs" / "agents" / "issue-tracker.md").is_file(),
+            "glossary": (root / "GLOSSARY.md").is_file(), "stack_record": stack, "languages": languages,
+            "adopted": (root / stagectl.CONFIG).is_file(),
+            "strict_rules_missing": sorted(set(languages) & STRICT) if not linted else [], "stage": stage}
+
+
+def sort_issues(found: dict[str, Any] | None) -> dict[str, Any]:
+    if found is None:
+        return {"reachable": False, "specs": [], "tickets": [], "maps": [], "pulls": []}
+    specs, tickets, maps = [], [], []
+    for issue in found["issues"]:
+        body, labels = issue.get("body") or "", {label["name"] for label in issue.get("labels", [])}
+        entry = {"number": issue["number"], "title": issue["title"], "open": issue["state"] == "open"}
+        if "wayfinder:map" in labels:
+            maps.append(entry)
+        elif "## User Stories" in body:
+            specs.append(entry)
+        elif "## Acceptance criteria" in body:
+            tickets.append({**entry, "for_owner": "ready-for-human" in labels, "blocked_by": issue.get("blocked_by", [])})
+    pulls = [pull for pull in found["pulls"] if not pull["branch"].startswith("research/")]
+    return {"reachable": True, "specs": specs, "tickets": tickets, "maps": maps, "pulls": pulls}
+
+
+def decide(here: dict[str, Any], work: dict[str, Any]) -> dict[str, Any]:
+    def at(step: int, state: str, command: str, owner: str = "Nothing.") -> dict[str, Any]:
+        return {"step": step, "name": STEPS[step], "state": state, "next": command, "you": owner}
+
+    stage, pulls = here["stage"], work["pulls"]
+    open_tickets = [ticket for ticket in work["tickets"] if ticket["open"]]
+    free = [ticket for ticket in open_tickets if not ticket["blocked_by"]]
+    mine, agents = [t for t in free if t["for_owner"]], [t for t in free if not t["for_owner"]]
+    chores = ("Do by hand: " + "; ".join(f"#{t['number']} {t['title']}" for t in mine) + ".") if mine else "Nothing."
+    if stage:
+        if stage["ready"]:
+            return at(5, f"\"{stage['name']}\" is proven on the current code.", "close the stage and open the pull request")
+        return at(5, f"\"{stage['name']}\" is being built. Still unproven: {'; '.join(stage['unproven']) or 'nothing listed'}.",
+                  "continue building this ticket")
+    if pulls:
+        first = pulls[0]
+        return at(6, f"Pull request #{first['number']} \"{first['title']}\" is open.", "check it is green, then ask the owner to merge",
+                  f"Merge pull request #{first['number']} when its checks are green.")
+    if not work["reachable"]:
+        return at(1, "GitHub could not be reached, so issues and pull requests are unknown.",
+                  "run `gh auth login`, then /next again", "Sign in to GitHub with `gh auth login`.")
+    open_specs = [spec for spec in work["specs"] if spec["open"]]
+    if not work["specs"]:
+        open_maps = [m for m in work["maps"] if m["open"]]
+        if here["stack_record"]:
+            return at(3, "The stack is chosen and no spec exists yet.", "/to-spec")
+        if open_maps:
+            return at(1, f"A decision map is open: #{open_maps[0]['number']} \"{open_maps[0]['title']}\".",
+                      f"/wayfinder {open_maps[0]['number']}", "Answer the open decisions.")
+        if here["glossary"]:
+            return at(1, "An interview has started and no spec exists yet.", "continue the interview, then choose the stack",
+                      "Answer the questions.")
+        return at(1, "Nothing is planned yet.", "/start <what you want to build>", "Describe what you want.")
+    if not here["stack_record"] and not here["languages"]:
+        return at(2, "There is a spec, no code, and no recorded stack.", "/stack", "Accept the recommended stack or change it.")
+    if not work["tickets"]:
+        return at(4, f"Spec #{work['specs'][-1]['number']} has no tickets yet.", f"/to-tickets {work['specs'][-1]['number']}",
+                  "Approve the list of tickets.")
+    if agents:
+        ticket = agents[0]
+        before = ""
+        if not here["adopted"]:
+            before = " The rules are not on yet: /adopt runs first."
+        elif here["strict_rules_missing"]:
+            before = f" Strict rules for {', '.join(here['strict_rules_missing'])} are not on yet: /adopt runs first."
+        return at(5, f"Ticket #{ticket['number']} \"{ticket['title']}\" is ready to build. "
+                     f"{len(open_tickets)} of {len(work['tickets'])} tickets are still open.{before}",
+                  f"/implement {ticket['number']}", (chores + " " if mine else "") + "Type /approve when the contract is shown.")
+    if mine:
+        return at(5, "Every ticket an agent can build is waiting on you.", "wait for the owner", chores)
+    if open_tickets:
+        waiting = "; ".join(f"#{t['number']} waits on {', '.join('#' + str(n) for n in t['blocked_by'])}" for t in open_tickets[:5])
+        return at(5, f"Every open ticket is blocked: {waiting}.", "find out why the blocking tickets are still open")
+    if open_specs:
+        return at(6, "Every ticket is closed.", f"close spec #{open_specs[-1]['number']}", "Try the product. Type /start for the next thing.")
+    return at(1, "The last spec is finished and closed.", "/start <what you want to build next>", "Describe what you want next.")
+
+
+def report(root: Path, found: dict[str, Any] | None) -> dict[str, Any]:
+    stagectl = load_stagectl()
+    here, work = local(root, stagectl), sort_issues(found)
+    return {**decide(here, work), "facts": {**here, "tracker_reachable": work["reachable"],
+                                            "specs": work["specs"], "tickets": work["tickets"], "pulls": work["pulls"]}}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="where", description=__doc__.splitlines()[0])
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--tracker-file", help="read issues and pull requests from this JSON file instead of `gh`")
+    args = parser.parse_args()
+    try:
+        root = load_stagectl().worktree_root(args.repo)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    found = json.loads(Path(args.tracker_file).read_text(encoding="utf-8")) if args.tracker_file else tracker(root)
+    result = report(root, found)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Step {result['step']} of 6: {result['name']}. {result['state']}")
+        print(f"You: {result['you']}")
+        print(f"Next: {result['next']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

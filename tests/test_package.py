@@ -13,7 +13,7 @@ SKILLS = PACKAGE / "skills"
 SKILL_REFERENCE = re.compile(r"\*\*([a-z][a-z0-9-]+)\*\* (?:principle )?skill")
 SIBLING_LINK = re.compile(r"\]\(\.\./([a-z0-9-]+)/SKILL\.md\)")
 # Skills from other plugins, the generated project skill, and Cursor built-ins.
-EXTERNAL = {"create-skill", "deslop", "control-ui", "control-cli", "babysit"}
+EXTERNAL = {"create-skill", "deslop", "control-ui", "control-cli", "babysit", "user-invoked", "model-invoked"}
 
 
 def skill_dirs() -> list[Path]:
@@ -59,7 +59,7 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn("poteto-mode", path.read_text(encoding="utf-8"), path)
 
     def test_what_only_the_owner_starts_is_never_loaded_by_an_agent(self) -> None:
-        for name in ("adopt", "approve", "setup-pstack", "govern", "stage", "correct", "garden"):
+        for name in ("start", "next", "trust-help", "adopt", "approve", "setup-pstack", "govern", "stage", "correct", "garden"):
             text = (SKILLS / name / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("disable-model-invocation: true", text.split("\n---\n", 1)[0], name)
         adopt = (SKILLS / "adopt" / "SKILL.md").read_text(encoding="utf-8")
@@ -67,7 +67,7 @@ class PackageTests(unittest.TestCase):
             self.assertIn(needed, adopt)
 
     def test_scripts_named_by_skills_exist(self) -> None:
-        for name in ("stagectl", "verifyctl", "rulectl", "rulekit", "adopt.py", "install.py"):
+        for name in ("stagectl", "verifyctl", "rulectl", "rulekit", "where", "adopt.py", "install.py"):
             self.assertTrue((PACKAGE / "scripts" / name).is_file())
 
 
