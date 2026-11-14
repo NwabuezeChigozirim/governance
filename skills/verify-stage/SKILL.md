@@ -64,6 +64,16 @@ stagectl --repo . verify --stage <stage-id> --contract .governance/stages/<short
 
 Then commit the file it writes and push it. The path is `.governance/verdicts/<record_sha256>.json`.
 
+When the repo's `.governance/config.json` sets `require_verdict_signature` to true, pass the private key that the owner enrolled for your checker identity. The key stays outside the repository.
+
+```bash
+stagectl --repo . verify --stage <stage-id> --contract .governance/stages/<short-name>.json \
+  --outcome pass --summary "<what you drove and what you observed>" \
+  --checker "<your name>" --key ~/.config/governance/verdict-key
+```
+
+The command also writes `.governance/verdicts/<record_sha256>.sig`. Commit that file with the verdict. Use the same `--key` on `stagectl reprove`. Your `--checker` name must be the principal on your line in `.governance/verdict-signers`.
+
 ```bash
 git add .governance/verdicts
 git commit -m "Record the independent verdict"

@@ -213,11 +213,14 @@ class GuardTests(unittest.TestCase):
     def test_agent_cannot_edit_the_config_or_write_a_receipt(self) -> None:
         self.assertEqual(self.edit(".governance/receipts/ST-x.json").get("permission"), "deny")
         self.assertEqual(self.edit(".governance/verdicts/0123.json").get("permission"), "deny")
+        self.assertEqual(self.edit(".governance/verdicts/0123.sig").get("permission"), "deny")
+        self.assertEqual(self.edit(".governance/verdict-signers").get("permission"), "deny")
         self.require_stage()
         self.freeze()
         self.assertEqual(self.edit(".governance/config.json").get("permission"), "deny")
         self.assertEqual(self.edit(".governance/receipts/ST-x.json").get("permission"), "deny")
         self.assertEqual(self.edit(".governance/verdicts/0123.json").get("permission"), "deny")
+        self.assertEqual(self.edit(".governance/verdict-signers").get("permission"), "deny")
 
     def test_agent_cannot_grow_the_rule_baseline(self) -> None:
         self.assertEqual(self.shell("python tools/governance/rulekit baseline --owner-approved").get("permission"), "deny")

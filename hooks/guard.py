@@ -163,7 +163,11 @@ def pre_tool_use(payload: dict) -> dict[str, str]:
         if relative.startswith(stagectl.RECEIPTS + "/"):
             return deny("Governance: a stage receipt is written only by `stagectl close`. Do not create or edit one.")
         if relative.startswith(stagectl.VERDICTS + "/"):
-            return deny("Governance: an independent verdict is written only by `stagectl verify`. Do not create or edit one.")
+            return deny("Governance: an independent verdict and its signature are written only by "
+                        "`stagectl verify` or `stagectl reprove`. Do not create or edit one.")
+        if relative == stagectl.SIGNERS:
+            return deny("Governance: only the owner changes .governance/verdict-signers. "
+                        "It is the list of keys allowed to sign verdicts.")
         settings = stagectl.config(root)
         if relative == stagectl.BASELINE and (root / stagectl.RULES).is_file():
             return deny("Governance: the baseline is written only by `rulekit baseline`, and it only shrinks. "
