@@ -40,8 +40,9 @@ is, not replaced.
 
 It never overwrites a file that exists, apart from refreshing `tools/governance/`.
 
-Adopting an empty project gives it only R-001 and R-002, because there is no language
-to choose a preset for. Run `adopt.py` again once the project has source files: it adds
+Adopting an empty project gives it only R-001 and R-002. When a Technology stack decision
+is recorded under `docs/adr/`, those two cover the language it chose; otherwise they
+cover Python. Run `adopt.py` again once the project has source files: it adds
 the strict rules for the languages it now finds, their bad examples, their rows in
 `AGENTS.md` and the linter install step in the workflow, and records today's findings
 for those new rules only. Violations of a rule that was already there are never forgiven
