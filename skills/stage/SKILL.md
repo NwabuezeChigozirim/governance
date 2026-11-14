@@ -69,9 +69,9 @@ A receipt is bound to the exact code that was tested. Any edit afterwards makes 
 
 ## 5. Get the independent verdict
 
-When `review` is `independent`, commit everything, then hand the stage ID and commit to a fresh agent with the **verify-stage** skill. Use a subagent or a cloud agent that has not seen this conversation. Give it the stage ID and the commit, not your reasoning.
+When `review` is `independent`, commit everything, including the contract, then hand the stage ID, the contract path, and the commit to a fresh agent with the **verify-stage** skill. Use a subagent or a cloud agent that has not seen this conversation. Give it those three, not your reasoning. A cloud agent on its own machine clones the commit and commits a verdict under `.governance/verdicts/`. Pull that commit before you close.
 
-You cannot record the verdict yourself: `stagectl verify` refuses the worktree that did the work, and requires the verifier's checkout to match your committed code exactly. If the verdict is `fail`, fix the root cause, commit, rerun the checks, and ask for a fresh verdict. Any edit after a verdict makes it stale.
+You cannot record the verdict yourself: `stagectl verify` refuses the worktree that did the work. On this clone, the verifier's worktree must match your committed code. On another clone, the verifier passes `--contract` and writes a verdict file you can pull. If the verdict is `fail`, fix the root cause, commit, rerun the checks, and ask for a fresh verdict. Any governed edit after a verdict makes it stale. Pulling the verdict commit changes HEAD, so run `stagectl run-check --all` again before close; the checks are stale even though the governed tree is unchanged.
 
 ## 6. Close
 
@@ -81,7 +81,7 @@ stagectl --repo . close
 
 It succeeds only when every check's latest attempt passed on the current code, the frozen inputs are unchanged, the outputs exist, and an independent stage has a passing verdict on that same code. It needs no owner flag.
 
-Closing writes a receipt to `.governance/receipts/<stage-id>.json`: the intent, the acceptance items, the checks, the verdict, and an ID for the exact code that was proven. Commit the receipt and change nothing else. The project's CI runs `stagectl gate`, which passes a pull request only when a committed receipt matches its code, so an edit after close (even a formatting fix) fails the gate until a new stage proves it. You never write or edit a receipt yourself; the hook blocks it.
+Closing writes a receipt to `.governance/receipts/<stage-id>.json`: the intent, the acceptance items, the checks, the verdict, and an ID for the exact code that was proven. When the verdict was recorded on this clone, close also writes `.governance/verdicts/<record_sha256>.json`. Commit the receipt and that verdict, and change nothing else. The project's CI runs `stagectl gate`, which passes a pull request only when a committed receipt matches its code, and, for an independent review, a committed verdict names that same tree. An edit after close (even a formatting fix) fails the gate until a new stage proves it. You never write or edit a receipt or a verdict yourself; the hook blocks it.
 
 Report the stage ID and the receipt path.
 

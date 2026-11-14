@@ -5,7 +5,7 @@ before-submit-prompt
   When the owner's own message is /approve, record a one-time grant (hooks/approval.py).
 pre-tool-use
   Always: an agent cannot record owner approval unless the owner granted it by typing
-  /approve, and cannot touch stage state or write a stage receipt by hand.
+  /approve, and cannot touch stage state, write a stage receipt, or write a verdict by hand.
   While a stage is active in this worktree: destructive or unclassified Git commands
   are blocked for owner review.
   In a project whose .governance/config.json sets require_stage: file edits are
@@ -162,6 +162,8 @@ def pre_tool_use(payload: dict) -> dict[str, str]:
             return {}
         if relative.startswith(stagectl.RECEIPTS + "/"):
             return deny("Governance: a stage receipt is written only by `stagectl close`. Do not create or edit one.")
+        if relative.startswith(stagectl.VERDICTS + "/"):
+            return deny("Governance: an independent verdict is written only by `stagectl verify`. Do not create or edit one.")
         settings = stagectl.config(root)
         if relative == stagectl.BASELINE and (root / stagectl.RULES).is_file():
             return deny("Governance: the baseline is written only by `rulekit baseline`, and it only shrinks. "
