@@ -89,7 +89,7 @@ Report the stage ID and the receipt path.
 
 ## After a rebase
 
-Rebasing onto a moved main changes the tree, so the committed verdict and the receipt no longer match and the gate rejects them. Wait until CI is green on the new head, then hand the checker the stage ID, the contract path, the old verdict's record hash, and the new commit. The checker runs `stagectl reprove` and commits a new verdict. That happens only when the patch is unchanged, and it does not ask the owner to approve again.
+Rebasing onto a moved main changes the tree, so the committed verdict and the receipt no longer match and the gate rejects them. Wait until CI is green on the new head. On a repository whose default branch has the Reprove workflow, and whose owner has stored the `governance-ci` key as the `GOVERNANCE_VERDICT_KEY` secret, that workflow runs `stagectl reprove` and commits a new signed verdict. You do not hold that key. Where the workflow is not installed, hand the checker the stage ID, the contract path, the old verdict's record hash, and the new commit, and the checker runs `stagectl reprove`. That happens only when the patch is unchanged, and it does not ask the owner to approve again.
 
 Pull that commit, then:
 

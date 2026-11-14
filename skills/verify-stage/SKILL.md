@@ -101,4 +101,6 @@ stagectl --repo . reprove --stage <stage-id> --supersedes <record_sha256> \
 
 If the patch changed, the command writes nothing. Stop and record a new verdict with `stagectl verify` instead. If a check fails, the command writes a failing verdict; leave that failure for the author. This step does not ask the owner to approve again.
 
+On a repository whose default branch has the Reprove workflow, and whose owner has stored the `governance-ci` key as the `GOVERNANCE_VERDICT_KEY` secret, that workflow runs this step after Verify is green. You do not run it yourself for that rebase, and you do not hold that key. A changed patch still waits for you.
+
 **Reply:** the intent as you restated it, the verdict, each finding with its command and output, and the entry points you could not reach with the reason.

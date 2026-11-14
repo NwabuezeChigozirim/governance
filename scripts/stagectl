@@ -11,6 +11,10 @@ verify     independent verdict: rerun the checks from another worktree, or from
            another clone when that clone has no local stage state
 reprove    after a rebase onto a new base, rerun those checks on the new tree
            and commit a fresh verdict when the patch is unchanged
+reprove-plan
+           say whether that re-proof should run; it does not run the checks
+sign-verdict
+           sign an existing verdict file; it does not run the checks
 revise     replace the contract with an owner-approved successor
 cancel     abandon the stage without completing it
 
@@ -1279,9 +1283,20 @@ def record_portable(root: Path, stage_id: str, outcome: str, summary: str, contr
             "signed": key is not None}
 
 
-def require_key(root: Path, key_path: str | None) -> Path | None:
-    """Sign when a key is given. Refuse to record an unsigned verdict once this checkout requires one."""
+CI_CHECKER = "governance-ci"
+
+
+def require_key(root: Path, key_path: str | None, defer: bool = False) -> Path | None:
+    """Sign when a key is given. Refuse to record an unsigned verdict once this checkout requires one.
+
+    ``defer`` writes the verdict without a signature so a later step can sign it without running the
+    checks again. The gate still rejects that file until the signature is there.
+    """
     key = verdict_key(root, key_path)
+    if defer:
+        if key is not None:
+            raise Invalid("--defer-signature writes an unsigned verdict; do not pass --key with it")
+        return None
     if key is None and config_flag(show_bytes(root, "HEAD", CONFIG), "HEAD"):
         raise Invalid("this checkout requires a signed verdict. Pass --key, or set GOVERNANCE_VERDICT_KEY, "
                       "to an ed25519 key that is not inside the repository")
@@ -1290,7 +1305,7 @@ def require_key(root: Path, key_path: str | None) -> Path | None:
 
 def reprove(root: Path, stage_id: str, supersedes: str, base: str, outcome: str, summary: str,
             contract_path: str | None, checker: str | None, control: str | None,
-            live_args: list[str] | None, key_path: str | None = None) -> dict[str, Any]:
+            live_args: list[str] | None, key_path: str | None = None, defer_signature: bool = False) -> dict[str, Any]:
     """Rerun the checks on a rebased tree and commit a fresh verdict when the patch is unchanged.
 
     An unchanged ``git patch-id --stable`` is required. The old verdict never saw this tree, so its
@@ -1313,7 +1328,7 @@ def reprove(root: Path, stage_id: str, supersedes: str, base: str, outcome: str,
     live = parse_live(live_args or [])
     identity = checker_identity(root, checker)
     control = clean_control(control)
-    key = require_key(root, key_path)
+    key = require_key(root, key_path, defer_signature)
     with locked(root):
         path = root / VERDICTS / f"{supersedes}.json"
         previous = read_json(path)
@@ -1362,6 +1377,65 @@ def reprove(root: Path, stage_id: str, supersedes: str, base: str, outcome: str,
         result["supersedes"] = previous["record_sha256"]
         result["patch_id"] = new_id
         return result
+
+
+def intact_verdicts(root: Path) -> list[dict[str, Any]]:
+    found = []
+    for path, value in load_verdicts(root):
+        if isinstance(value, dict) and not verdict_shape(path, value):
+            found.append(value)
+    return found
+
+
+def reproof_plan(root: Path, base: str) -> dict[str, Any]:
+    """Decide whether an automatic re-proof should run. This does not run checks or write a verdict.
+
+    Skip when any intact verdict already names the current governed tree, so a push of a new verdict
+    does not queue another one. Skip when the latest passing verdict's patch-id differs: that change
+    needs a human checker. Otherwise name the verdict a re-proof would supersede.
+    """
+    if not base:
+        raise Invalid("--base is required: the ref this branch was rebased onto, such as origin/main")
+    tree = governed_tree(root)
+    if governed_tree(root, "HEAD") != tree:
+        raise Invalid("commit the code under judgment first; this checkout's governed files differ from HEAD")
+    commit = git(root, "rev-parse", "HEAD")
+    required, _signers = signature_policy(root, base)
+    report: dict[str, Any] = {"tree": tree, "commit": commit, "require_signature": required, "checker": CI_CHECKER}
+    verdicts = intact_verdicts(root)
+    if any(item["head"]["tree"] == tree for item in verdicts):
+        return {**report, "action": "skip", "reason": "a verdict already exists for this tree"}
+    passing = sorted((item for item in verdicts if item["outcome"] == "pass"),
+                     key=lambda item: (item["recorded_at"], item["record_sha256"]))
+    if not passing:
+        return {**report, "action": "skip", "reason": "no passing verdict to re-prove"}
+    latest = passing[-1]
+    try:
+        new_id = change_patch_id(root, git(root, "merge-base", base, commit), commit)
+        old_id = change_patch_id(root, git(root, "merge-base", base, latest["head"]["commit"]), latest["head"]["commit"])
+    except Invalid as exc:
+        return {**report, "action": "skip", "reason": str(exc), "supersedes": latest["record_sha256"]}
+    if new_id != old_id:
+        return {**report, "action": "skip", "reason": "the patch-id changed; record a new verdict with stagectl verify",
+                "supersedes": latest["record_sha256"], "patch_id": new_id, "previous_patch_id": old_id}
+    return {**report, "action": "reprove", "reason": "the tree moved and the patch-id is unchanged",
+            "stage_id": latest["stage_id"], "supersedes": latest["record_sha256"],
+            "contract": latest["checked"]["contract_path"], "base": base, "patch_id": new_id}
+
+
+def sign_existing(root: Path, record_hash: str, key_path: str | None) -> dict[str, Any]:
+    """Sign a verdict that is already written. Does not run the frozen checks."""
+    if not sha256_text(record_hash, 64):
+        raise Invalid("--record must be the verdict's record hash")
+    path = root / VERDICTS / f"{record_hash}.json"
+    value = read_json(path)
+    if not isinstance(value, dict) or verdict_shape(path, value) or value.get("record_sha256") != record_hash:
+        raise Invalid(f"no intact verdict {record_hash} is committed in this checkout")
+    key = verdict_key(root, key_path)
+    if key is None:
+        raise Invalid("pass --key, or set GOVERNANCE_VERDICT_KEY, to a key that is not inside the repository")
+    sign_record(root, record_hash, key)
+    return {"record_sha256": record_hash, "signed": True, "verdict": str(path)}
 
 
 def resume(root: Path) -> dict[str, Any]:
@@ -1531,6 +1605,13 @@ def main() -> int:
     reprove_parser.add_argument("--control")
     reprove_parser.add_argument("--live", action="append", default=[])
     reprove_parser.add_argument("--key", help="private key outside the repo; or set GOVERNANCE_VERDICT_KEY")
+    reprove_parser.add_argument("--defer-signature", action="store_true",
+                                help="write the verdict without signing; the gate still requires a signature")
+    plan_parser = commands.add_parser("reprove-plan")
+    plan_parser.add_argument("--base", required=True, help="ref this branch was rebased onto, such as origin/main")
+    sign_parser = commands.add_parser("sign-verdict")
+    sign_parser.add_argument("--record", required=True, help="record hash of an existing verdict file")
+    sign_parser.add_argument("--key", help="private key outside the repo; or set GOVERNANCE_VERDICT_KEY")
     commands.add_parser("resume")
     commands.add_parser("close")
     commands.add_parser("cancel").add_argument("--reason", required=True)
@@ -1557,8 +1638,12 @@ def main() -> int:
             code = 0 if result["outcome"] == "pass" else 3
         elif args.command == "reprove":
             result = reprove(root, args.stage, args.supersedes, args.base, args.outcome, args.summary,
-                             args.contract, args.checker, args.control, args.live, args.key)
+                             args.contract, args.checker, args.control, args.live, args.key, args.defer_signature)
             code = 0 if result["outcome"] == "pass" else 3
+        elif args.command == "reprove-plan":
+            result, code = reproof_plan(root, args.base), 0
+        elif args.command == "sign-verdict":
+            result, code = sign_existing(root, args.record, args.key), 0
         elif args.command == "resume":
             result, code = resume(root), 0
         elif args.command == "close":
@@ -1588,7 +1673,7 @@ def main() -> int:
         summary = {k: v for k, v in result.items() if k in ("frozen", "changed", "revised", "closed", "cancelled",
                                                             "ready", "passed", "stage_id", "receipt", "outcome",
                                                             "verdict", "tree", "reason", "resumed", "supersedes",
-                                                            "patch_id", "record_sha256")
+                                                            "patch_id", "record_sha256", "action", "reason", "signed")
                    and not isinstance(v, dict)}
         if summary:
             print(json.dumps(summary))
