@@ -108,6 +108,32 @@ class AdoptTests(unittest.TestCase):
         self.assertEqual(json.loads(baseline.read_text())["counts"]["R-001"], {"src/app.ts": 1})
         self.assertIn("**/*.py", json.loads((self.repo / ".governance/rules.json").read_text())["rules"][0]["include"])
 
+    def test_an_empty_project_takes_its_language_from_the_recorded_stack(self) -> None:
+        (self.repo / "src" / "app.ts").unlink()
+        adr = self.repo / "docs" / "adr"
+        adr.mkdir(parents=True)
+        (adr / "0002-technology-stack.md").write_text(
+            "# Technology stack\n\nOne TypeScript application on Node, using Next.js.\n\n"
+            "## Considered options\n\n- Python with FastAPI was turned down.\n", encoding="utf-8")
+        out = self.adopt()
+        self.assertIn("the recorded stack chose ts", out)
+        rules = json.loads((self.repo / ".governance/rules.json").read_text())["rules"]
+        self.assertIn("**/*.ts", rules[0]["include"])
+        self.assertNotIn("**/*.py", rules[0]["include"])
+        self.assertTrue((self.repo / ".governance" / "bad" / "R-001.ts").is_file())
+        self.assertEqual(self.tool("rulectl", "check", "--repo", ".", "--prove"), 0)
+        (self.repo / "src" / "page.ts").write_text("// why this is here\nexport const a = 1;\n", encoding="utf-8")
+        self.assertEqual(self.tool("rulekit", "check"), 3)
+
+    def test_code_outranks_the_recorded_stack(self) -> None:
+        adr = self.repo / "docs" / "adr"
+        adr.mkdir(parents=True)
+        (adr / "0001-technology-stack.md").write_text("# Technology stack\n\nPython with FastAPI.\n", encoding="utf-8")
+        self.adopt()
+        rules = json.loads((self.repo / ".governance/rules.json").read_text())["rules"]
+        self.assertIn("**/*.ts", rules[0]["include"])
+        self.assertNotIn("**/*.py", rules[0]["include"])
+
     def test_file_length_rule_is_installed_and_proven(self) -> None:
         self.adopt()
         self.assertEqual(self.tool("rulekit", "check", "--rule", "R-002", ".governance/bad/R-002.ts"), 3)

@@ -1,7 +1,7 @@
 {
 	"name": "trust",
 	"displayName": "trust",
-	"version": "4.0.0-alpha.2",
+	"version": "4.0.0-alpha.3",
 	"description": "One path from an idea to merged code you can trust: an interview, a stack, a spec, tickets, then each ticket built under enforced rules and proven before it merges.",
 	"license": "MIT",
 	"keywords": [

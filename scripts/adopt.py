@@ -156,6 +156,33 @@ NODE_SETUP = """      - uses: actions/setup-node@v4
 PLANNING_DOCS = ("GLOSSARY.md", "GLOSSARY-MAP.md", "**/GLOSSARY.md", "docs/adr/**", "**/docs/adr/**",
                  "docs/agents/**", ".scratch/**")
 
+NAMED = {"python": "py", "typescript": "ts", "javascript": "js", "golang": "go", "rust": "rs", "java": "java",
+         "kotlin": "kt", "c#": "cs", "swift": "swift", "dart": "dart"}
+
+
+def stack_language(repo: Path) -> str | None:
+    """The language a recorded Technology stack decision chose, for a project with no code yet.
+
+    Only the decision itself is read, not its later sections, which name the options turned
+    down. The language named first in it is the one chosen.
+    """
+    folder = repo / "docs" / "adr"
+    for path in sorted(folder.glob("*.md")) if folder.is_dir() else []:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if not lines or "technology stack" not in lines[0].lower():
+            continue
+        decision = []
+        for line in lines[1:]:
+            if line.startswith("#"):
+                break
+            decision.append(line)
+        text = " ".join(decision).lower()
+        found = [(text.find(word), code) for word, code in NAMED.items() if word in text]
+        if found:
+            return min(found)[1]
+    return None
+
+
 def tracked_files(repo: Path) -> list[str]:
     result = subprocess.run(["git", "-C", str(repo), "ls-files", "-co", "--exclude-standard"],
                             capture_output=True, text=True, check=False)
@@ -273,6 +300,11 @@ def adopt(repo: Path) -> list[str]:
 
     present = sorted({LANGUAGES[Path(name).suffix] for name in files
                       if Path(name).suffix in LANGUAGES and not name.startswith(("tools/governance/", ".governance/"))})
+    if not present:
+        chosen_language = stack_language(repo)
+        if chosen_language:
+            present = [chosen_language]
+            done.append(f"no source files yet; the recorded stack chose {chosen_language}, so the starter rules cover it")
     suffixes = sorted(suffix for suffix, language in LANGUAGES.items() if language in present) or [".py"]
     language = "py" if "py" in present or not present else present[0]
     governance = repo / ".governance"
