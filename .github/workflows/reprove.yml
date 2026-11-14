@@ -185,11 +185,6 @@ jobs:
         with:
           name: verdict-${{ needs.reprove.outputs.record }}
           path: pr/.governance/verdicts
-      - name: Stop when a required signing key is absent
-        if: needs.plan.outputs.sign == 'true' && secrets.GOVERNANCE_VERDICT_KEY == ''
-        run: |
-          echo "GOVERNANCE_VERDICT_KEY is not set. Not signing and not pushing."
-          exit 1
       - name: Sign the verdict hash
         if: needs.plan.outputs.sign == 'true'
         env:

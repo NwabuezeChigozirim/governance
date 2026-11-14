@@ -24,7 +24,8 @@ class ReproveWorkflow(unittest.TestCase):
         self.assertNotIn("sign-verdict", reprove)
         self.assertNotIn("reprove ", publish)
         self.assertNotIn("run-check", publish)
-        self.assertIn("secrets.GOVERNANCE_VERDICT_KEY == ''", publish)
+        self.assertNotIn("secrets.GOVERNANCE_VERDICT_KEY ==", text)
+        self.assertIn('if [ -z "$VERDICT_KEY" ]', publish)
         self.assertIn("exit 1", publish)
 
 
