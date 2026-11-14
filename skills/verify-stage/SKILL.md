@@ -76,4 +76,19 @@ Declare `fail` when any proven finding breaks the intent. Do not fix the code; t
 
 Screenshots and recordings stay under `.verify/`. Do not commit them.
 
+## 6. After a rebase
+
+A rebase onto a moved base changes the tree the verdict is bound to. The old verdict is then stale, and you do not edit it. When the author has rebased, CI is green on the new head, and `git patch-id --stable` of the branch against the new base matches the patch the old verdict covered, re-run on that new commit:
+
+```bash
+stagectl --repo . reprove --stage <stage-id> --supersedes <record_sha256> \
+  --base origin/main --contract .governance/stages/<short-name>.json \
+  --outcome pass --summary "<what you drove on the rebased tree and what you observed>" \
+  --checker "<your name>"
+```
+
+`--supersedes` is the record hash in the name of the verdict you are replacing. `--base` is the ref the branch was rebased onto. The command runs the frozen checks again. It writes a new file under `.governance/verdicts/` whose `supersedes` names the old record, the old commit, and the old tree. Commit that file and push it. Do not delete the old file.
+
+If the patch changed, the command writes nothing. Stop and record a new verdict with `stagectl verify` instead. If a check fails, the command writes a failing verdict; leave that failure for the author. This step does not ask the owner to approve again.
+
 **Reply:** the intent as you restated it, the verdict, each finding with its command and output, and the entry points you could not reach with the reason.

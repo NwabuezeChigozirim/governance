@@ -125,5 +125,5 @@ You never need these. They are there when you want something off the main path.
 - Building a ticket through to a merged pull request has not been seen end to end in Cursor yet, nor have `/start`, `/next` and `/approve`.
 - `/next` reads GitHub issues. A project that keeps tickets as local files is not supported by it yet.
 - A file written by a shell command bypasses the edit-time hook. The gate still catches it.
-- Receipts can be forged by someone determined; the gate guards against mistakes, not an adversary. An independent verdict is a file under `.governance/verdicts/` that names the exact code it judged. The hash shows the file was not edited after it was written. It does not show who wrote it.
+- Receipts can be forged by someone determined; the gate guards against mistakes, not an adversary. An independent verdict is a file under `.governance/verdicts/` that names the exact code it judged. The hash shows the file was not edited after it was written. It does not show who wrote it. A rebase needs a new verdict from `stagectl reprove`: the checker runs the checks again on the new tree, and only when `git patch-id --stable` is unchanged. The old verdict still fails the gate on its own.
 - `/approve` covers one ticket at a time. `/implement-spec` still hands you terminal commands.

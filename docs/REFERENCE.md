@@ -187,7 +187,19 @@ scripts/stagectl --repo . verify --stage ST-... --contract .governance/stages/<s
 
 The committed record is `.governance/verdicts/<record_sha256>.json`. It names who checked (`checker`), which head (`head.commit` and the governed `head.tree`), which checks ran and how they finished (`checked`), and what was seen (`evidence`). `report` is `PASS`, `FAIL`, or `INVALID`. `record_sha256` is the hash of the other fields, and the file name is that hash.
 
-`stagectl gate` recomputes the governed tree and reads the contract file the verdict names. It rejects a missing verdict, a verdict whose hash does not match its contents, a verdict for a different tree, a verdict whose commit does not contain that tree, a verdict whose contract file changed, and a verdict that is missing a required field. The hash binds those fields together. It proves what the record says was checked. It does not prove who ran the command: anyone who can commit can write a new file with a new hash. Signing the checker is a follow-up. A rebase that keeps the same patch but changes the tree needs a new verdict; carrying an old verdict across a rebase by patch id is a separate follow-up.
+`stagectl gate` recomputes the governed tree and reads the contract file the verdict names. It rejects a missing verdict, a verdict whose hash does not match its contents, a verdict for a different tree, a verdict whose commit does not contain that tree, a verdict whose contract file changed, a verdict that is missing a required field, and a re-proof whose `supersedes` link does not match the predecessor it names. The hash binds those fields together. It proves what the record says was checked. It does not prove who ran the command: anyone who can commit can write a new file with a new hash. Signing the checker is a follow-up.
+
+A rebase onto new commits changes the tree even when the patch is the same, so the old verdict stops matching and the gate rejects it. That rejection stays. Carrying the old file forward is not allowed. After the rebase, and after CI is green on the new head, the checker runs `stagectl reprove` on a clone that does not hold the stage. Re-proof runs the frozen checks again on the new tree and writes a new verdict. It does not copy the old one.
+
+An unchanged `git patch-id --stable` is required before that re-proof runs with no new approval. The id is the diff from the merge-base with `--base` to the commit, ignoring `.governance/verdicts` and `.governance/receipts`, because those files are the proof rather than the change. The same id is computed for the superseded commit. If the two ids differ, reprove writes nothing: the patch changed, and that needs a new `stagectl verify`. If the ids match and a check fails, reprove writes a failing verdict and the gate rejects it. The new file's `supersedes` names the old record hash, the old commit, and the old tree. `patch_id` and `patch_base` name the new side. `head` is the new commit and the new tree.
+
+```bash
+scripts/stagectl --repo . reprove --stage ST-... --supersedes <record_sha256> --base origin/main \
+  --contract .governance/stages/<short-name>.json --outcome pass \
+  --summary "Re-ran the totals form on the rebased tree and saw thirty" --checker "<your name>"
+```
+
+The author then pulls that commit and runs `stagectl resume`, `stagectl run-check --all`, and `stagectl close`. Resume reopens the same stage with no new approval, and only when that passing re-proof already covers the current tree. Close writes a receipt for the new tree and leaves the receipt for the old tree in place.
 
 This separates checkouts, not identities. On one machine it proves the work was committed and passes in a clean worktree. Across machines it proves a clean checkout of that commit passed the frozen checks, and it records the live drive the checker claims. It still cannot prove a different agent ran the command.
 
