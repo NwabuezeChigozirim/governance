@@ -85,6 +85,20 @@ Closing writes a receipt to `.governance/receipts/<stage-id>.json`: the intent, 
 
 Report the stage ID and the receipt path.
 
+## After a rebase
+
+Rebasing onto a moved main changes the tree, so the committed verdict and the receipt no longer match and the gate rejects them. Wait until CI is green on the new head, then hand the checker the stage ID, the contract path, the old verdict's record hash, and the new commit. The checker runs `stagectl reprove` and commits a new verdict. That happens only when the patch is unchanged, and it does not ask the owner to approve again.
+
+Pull that commit, then:
+
+```bash
+stagectl --repo . resume
+stagectl --repo . run-check --all
+stagectl --repo . close
+```
+
+Resume reopens this same stage. It refuses when there is no passing re-proof for the current tree, so it is not a way to skip approval. Close writes a receipt for the new tree and leaves the old receipt in place. Commit the new receipt.
+
 ## When the agreement changes
 
 - A frozen input changed, or the intent, acceptance or checks must change: update the contract file, show the owner the new version, ask them to type `/approve`, then run `stagectl revise --contract .governance/stages/<short-name>.json --owner-approved --reason "..."`. All checks start over.
