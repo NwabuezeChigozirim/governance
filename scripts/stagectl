@@ -15,6 +15,10 @@ reprove-plan
            say whether that re-proof should run; it does not run the checks
 sign-verdict
            sign an existing verdict file; it does not run the checks
+signer-line
+           print the governance-ci allowed-signers line for a public key
+signer-setup-plan
+           say whether the automatic governance-ci key should be created
 revise     replace the contract with an owner-approved successor
 cancel     abandon the stage without completing it
 
@@ -1423,6 +1427,61 @@ def reproof_plan(root: Path, base: str) -> dict[str, Any]:
             "contract": latest["checked"]["contract_path"], "base": base, "patch_id": new_id}
 
 
+def format_signer_line(public_key: str) -> str:
+    """The one allowed-signers line for the automatic checker. The comment on the public key is dropped."""
+    parts = public_key.split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519" or not re.fullmatch(r"[A-Za-z0-9+/]{40,}={0,2}", parts[1]):
+        raise Invalid("signer-line expects an ssh-ed25519 public key")
+    return f'{CI_CHECKER} namespaces="{SIGNATURE_NAMESPACE}" ssh-ed25519 {parts[1]}\n'
+
+
+def governance_ci_signer(text: str) -> str | None:
+    """The governance-ci line on main, or None when the automatic checker is not listed.
+
+    A governance-ci line that is not an ed25519 key for this namespace is refused. Treating it as
+    absent would let a later run create a second key.
+    """
+    found = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.split(maxsplit=1)[0] != CI_CHECKER:
+            continue
+        found.append(line)
+    if not found:
+        return None
+    if len(found) != 1:
+        raise Invalid(".governance/verdict-signers has more than one governance-ci line")
+    parts = found[0].split()
+    if (len(parts) < 4 or parts[1] != f'namespaces="{SIGNATURE_NAMESPACE}"' or parts[2] != "ssh-ed25519"
+            or not re.fullmatch(r"[A-Za-z0-9+/]{40,}={0,2}", parts[3])):
+        raise Invalid("the governance-ci line is not an ed25519 key in the governance-verdict namespace")
+    return found[0]
+
+
+def signer_setup_plan(secret_present: bool, signers_text: str) -> dict[str, str]:
+    """Decide the one-time key setup. Never describes a rotation.
+
+    Both halves present is a no-op. Either half alone is a stop: a new key would not match the
+    half that is already published.
+    """
+    line = governance_ci_signer(signers_text)
+    if secret_present and line is not None:
+        return {"action": "noop",
+                "reason": "GOVERNANCE_VERDICT_KEY and the governance-ci signer line are already in place. No change."}
+    if secret_present:
+        return {"action": "fail",
+                "reason": "GOVERNANCE_VERDICT_KEY is already set, but .governance/verdict-signers on main has no "
+                          "governance-ci line. Refusing to rotate the key."}
+    if line is not None:
+        return {"action": "fail",
+                "reason": "A governance-ci line is already on main, but GOVERNANCE_VERDICT_KEY is absent. "
+                          "Refusing to create a new key."}
+    return {"action": "create",
+            "reason": "No governance-ci signing key is stored and main has no governance-ci signer line."}
+
+
 def sign_existing(root: Path, record_hash: str, key_path: str | None) -> dict[str, Any]:
     """Sign a verdict that is already written. Does not run the frozen checks."""
     if not sha256_text(record_hash, 64):
@@ -1612,6 +1671,15 @@ def main() -> int:
     sign_parser = commands.add_parser("sign-verdict")
     sign_parser.add_argument("--record", required=True, help="record hash of an existing verdict file")
     sign_parser.add_argument("--key", help="private key outside the repo; or set GOVERNANCE_VERDICT_KEY")
+    line_parser = commands.add_parser("signer-line")
+    line_parser.add_argument("--public-key", required=True, help="ssh-ed25519 public key file")
+    setup_parser = commands.add_parser("signer-setup-plan")
+    presence = setup_parser.add_mutually_exclusive_group(required=True)
+    presence.add_argument("--secret-present", action="store_true",
+                          help="GOVERNANCE_VERDICT_KEY is already a repository secret")
+    presence.add_argument("--secret-absent", action="store_true",
+                          help="GOVERNANCE_VERDICT_KEY is not a repository secret")
+    setup_parser.add_argument("--signers", help="allowed-signers file; a missing file means the list is empty")
     commands.add_parser("resume")
     commands.add_parser("close")
     commands.add_parser("cancel").add_argument("--reason", required=True)
@@ -1644,6 +1712,19 @@ def main() -> int:
             result, code = reproof_plan(root, args.base), 0
         elif args.command == "sign-verdict":
             result, code = sign_existing(root, args.record, args.key), 0
+        elif args.command == "signer-line":
+            key_path = Path(args.public_key)
+            if not key_path.is_file():
+                raise Invalid(f"public key not found: {args.public_key}")
+            result, code = {"line": format_signer_line(key_path.read_text(encoding="utf-8"))}, 0
+        elif args.command == "signer-setup-plan":
+            signers_path = Path(args.signers) if args.signers else None
+            # A missing list is the first-run state. A present file that is unreadable still raises.
+            signers_text = ""
+            if signers_path is not None and signers_path.is_file():
+                signers_text = signers_path.read_text(encoding="utf-8")
+            result = signer_setup_plan(args.secret_present, signers_text)
+            code = 0 if result["action"] != "fail" else 2
         elif args.command == "resume":
             result, code = resume(root), 0
         elif args.command == "close":
@@ -1677,6 +1758,9 @@ def main() -> int:
                    and not isinstance(v, dict)}
         if summary:
             print(json.dumps(summary))
+    if args.command == "signer-line" and not args.json and "line" in result:
+        sys.stdout.write(result["line"])
+        return code
     return code
 
 
