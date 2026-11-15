@@ -1,0 +1,183 @@
+# Create the governance-ci signing key once.
+#
+# Runs only on main: a push of this file or of scripts/stagectl, or a manual run.
+# It does not run for pull requests or forks. A manual run from any other branch
+# is skipped. The job's token can read the repository. Writing the secret and
+# opening the signer pull request use GOVERNANCE_SETUP_TOKEN.
+name: Signer setup
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/signer-setup.yml
+      - scripts/stagectl
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Require the one-time setup token
+        env:
+          GOVERNANCE_SETUP_TOKEN: ${{ secrets.GOVERNANCE_SETUP_TOKEN }}
+        run: |
+          if [ -z "${GOVERNANCE_SETUP_TOKEN}" ]; then
+            echo "GOVERNANCE_SETUP_TOKEN is not set, so this workflow cannot store a signing key or open a pull request."
+            echo "Create a fine-grained personal access token at https://github.com/settings/personal-access-tokens/new"
+            echo "Repository access: only this repository."
+            echo "Permissions: Secrets read and write, Contents read and write, Pull requests read and write."
+            echo "Save it as the Actions secret GOVERNANCE_SETUP_TOKEN (repository Settings, Secrets and variables, Actions)."
+            echo "Run Signer setup again from the Actions tab, on main."
+            echo "This workflow did not generate a key."
+            exit 1
+          fi
+          echo "::add-mask::${GOVERNANCE_SETUP_TOKEN}"
+
+      - name: Decide whether a key is needed
+        id: plan
+        env:
+          GOVERNANCE_SETUP_TOKEN: ${{ secrets.GOVERNANCE_SETUP_TOKEN }}
+        run: |
+          echo "::add-mask::${GOVERNANCE_SETUP_TOKEN}"
+          export GH_TOKEN="${GOVERNANCE_SETUP_TOKEN}"
+          names="$(gh secret list --repo "${GITHUB_REPOSITORY}" --app actions --json name --jq '.[].name')"
+          flag=--secret-absent
+          if printf '%s\n' "${names}" | grep -qx 'GOVERNANCE_VERDICT_KEY'; then
+            flag=--secret-present
+          fi
+          set +e
+          python3 -B scripts/stagectl --repo . --json signer-setup-plan "${flag}" \
+            --signers .governance/verdict-signers > "${RUNNER_TEMP}/plan.json"
+          plan_code=$?
+          set -e
+          if [ "${plan_code}" -ne 0 ] && [ ! -s "${RUNNER_TEMP}/plan.json" ]; then
+            echo "signer-setup-plan failed before it could decide."
+            exit "${plan_code}"
+          fi
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          plan = json.loads(pathlib.Path(os.environ["RUNNER_TEMP"], "plan.json").read_text(encoding="utf-8"))
+          action = plan.get("action", "")
+          reason = plan.get("reason") or plan.get("error") or "signer setup did not return a decision"
+          print(reason)
+          if action not in {"noop", "create", "fail"}:
+              action = "fail"
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"action={action}\n")
+          pathlib.Path(os.environ["RUNNER_TEMP"], "signer-action").write_text(action, encoding="utf-8")
+          PY
+          action="$(cat "${RUNNER_TEMP}/signer-action")"
+          if [ "${action}" = "fail" ] && [ "${flag}" = "--secret-present" ]; then
+            owner="${GITHUB_REPOSITORY%%/*}"
+            url="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${owner}:governance-ci-signer" \
+              --base main --state open --json url --jq '.[0].url // empty')"
+            if [ -n "${url}" ]; then
+              echo "An open signer pull request is ${url}. Merging it is the approval. This workflow will not rotate the key."
+            else
+              echo "No open signer pull request was found. Delete the GOVERNANCE_VERDICT_KEY secret before running setup again. This workflow will not rotate the key."
+            fi
+          fi
+          if [ "${action}" = "fail" ]; then
+            unset GH_TOKEN GOVERNANCE_SETUP_TOKEN
+            exit 2
+          fi
+          unset GH_TOKEN GOVERNANCE_SETUP_TOKEN
+
+      - name: Generate the key on the runner
+        if: steps.plan.outputs.action == 'create'
+        run: |
+          umask 077
+          dir="${RUNNER_TEMP}/governance-ci-key"
+          mkdir -p "${dir}"
+          ssh-keygen -t ed25519 -f "${dir}/verdict-key" -N "" -C "governance-ci" -q
+          python3 -B scripts/stagectl --repo . signer-line --public-key "${dir}/verdict-key.pub" \
+            > "${RUNNER_TEMP}/signer-line.txt"
+          python3 -B - <<'PY'
+          import os, pathlib
+          key = pathlib.Path(os.environ["RUNNER_TEMP"], "governance-ci-key", "verdict-key").read_text(encoding="utf-8")
+          for line in key.splitlines():
+              if line.strip():
+                  print(f"::add-mask::{line}", flush=True)
+          PY
+
+      - name: Store the key and open the signer pull request
+        if: steps.plan.outputs.action == 'create'
+        env:
+          GOVERNANCE_SETUP_TOKEN: ${{ secrets.GOVERNANCE_SETUP_TOKEN }}
+        run: |
+          echo "::add-mask::${GOVERNANCE_SETUP_TOKEN}"
+          export GH_TOKEN="${GOVERNANCE_SETUP_TOKEN}"
+          key_dir="${RUNNER_TEMP}/governance-ci-key"
+          wipe() {
+            python3 -B - <<'PY'
+          import os, pathlib
+          path = pathlib.Path(os.environ["RUNNER_TEMP"], "governance-ci-key", "verdict-key")
+          if path.is_file():
+              size = path.stat().st_size
+              with path.open("r+b") as handle:
+                  handle.write(b"\0" * size)
+                  handle.flush()
+                  os.fsync(handle.fileno())
+              path.unlink()
+          pub = path.with_suffix(".pub")
+          if pub.is_file():
+              pub.unlink()
+          PY
+          }
+          trap wipe EXIT
+          set +e
+          git -c "http.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}" \
+            ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" governance-ci-signer >/dev/null
+          remote_code=$?
+          set -e
+          if [ "${remote_code}" -eq 0 ]; then
+            echo "The branch governance-ci-signer already exists. Not overwriting it and not creating another key."
+            exit 1
+          fi
+          if [ "${remote_code}" -ne 2 ]; then
+            echo "Could not check whether governance-ci-signer exists. Not storing a key."
+            exit "${remote_code}"
+          fi
+          python3 -B - <<'PY'
+          import os, pathlib
+          line = pathlib.Path(os.environ["RUNNER_TEMP"], "signer-line.txt").read_text(encoding="utf-8")
+          if not line.endswith("\n"):
+              line += "\n"
+          path = pathlib.Path(".governance", "verdict-signers")
+          existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+          if "governance-ci " in existing or existing.startswith("governance-ci "):
+              raise SystemExit("a governance-ci line is already in the checkout; not writing a second one")
+          path.parent.mkdir(parents=True, exist_ok=True)
+          if existing and not existing.endswith("\n"):
+              existing += "\n"
+          path.write_text(existing + line, encoding="utf-8")
+          PY
+          git add -- .governance/verdict-signers
+          git -c user.name=governance-ci -c user.email=governance-ci@users.noreply.github.com \
+            commit -q -m "Publish the governance-ci verdict signer"
+          gh secret set GOVERNANCE_VERDICT_KEY --repo "${GITHUB_REPOSITORY}" --app actions < "${key_dir}/verdict-key"
+          wipe
+          git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
+            push "https://github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/governance-ci-signer"
+          gh pr create --repo "${GITHUB_REPOSITORY}" --base main --head governance-ci-signer \
+            --title "Publish the governance-ci verdict signer" \
+            --body-file - <<'EOF'
+          Merging this pull request is your approval of the `governance-ci` public key.
+
+          The private key was created in GitHub Actions and stored as the repository secret `GOVERNANCE_VERDICT_KEY`. It is not in this pull request. This workflow does not merge or approve itself. The gate reads trusted signers from the base branch, so this key is not trusted until you merge.
+
+          Signatures stay optional until `require_verdict_signature` is true on main.
+          EOF
+          unset GH_TOKEN GOVERNANCE_SETUP_TOKEN

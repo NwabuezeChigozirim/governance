@@ -212,11 +212,23 @@ scripts/stagectl --repo . reprove --stage ST-... --supersedes <record_sha256> --
 
 The author then pulls that commit and runs `stagectl resume`, `stagectl run-check --all`, and `stagectl close`. Resume reopens the same stage with no new approval, and only when that passing re-proof already covers the current tree. Close writes a receipt for the new tree and leaves the receipt for the old tree in place.
 
-After Verify is green on a same-repository pull request, `.github/workflows/reprove.yml` can run that re-proof itself. The workflow file that runs is the one on the default branch. The checker is `governance-ci`, a key held only as the Actions secret `GOVERNANCE_VERDICT_KEY`, not by the agent that wrote the change. `stagectl reprove-plan --base origin/<base>` decides. It says `reprove` when the latest passing verdict is for an older tree and `git patch-id --stable` is unchanged. It says `skip` when a verdict already names the current tree, when the patch-id changed, or when there is no passing verdict. A skip does not push. The checks run in a job that has no signing key. A later job signs the verdict hash with the secret and pushes only the new verdict files. If a signature is required and the secret is absent, that job stops and pushes nothing. Fork pull requests are ignored. The workflow does not run until it is on the default branch. The owner generates the key, stores the private key as `GOVERNANCE_VERDICT_KEY`, and commits this public line on the base before turning `require_verdict_signature` on:
+After Verify is green on a same-repository pull request, `.github/workflows/reprove.yml` can run that re-proof itself. The workflow file that runs is the one on the default branch. The checker is `governance-ci`, a key held only as the Actions secret `GOVERNANCE_VERDICT_KEY`, not by the agent that wrote the change. `stagectl reprove-plan --base origin/<base>` decides. It says `reprove` when the latest passing verdict is for an older tree and `git patch-id --stable` is unchanged. It says `skip` when a verdict already names the current tree, when the patch-id changed, or when there is no passing verdict. A skip does not push. The checks run in a job that has no signing key. A later job signs the verdict hash with the secret and pushes only the new verdict files. If a signature is required and the secret is absent, that job stops and pushes nothing. Fork pull requests are ignored. The workflow does not run until it is on the default branch.
+
+The `governance-ci` key is created by `.github/workflows/signer-setup.yml`, not by hand. The owner does not run `ssh-keygen` and never sees the private key. The workflow runs on main when this file or `scripts/stagectl` changes, and from the Actions tab. It does not run on pull requests or from forks. If the secret and a `governance-ci` line are already on main, it logs that nothing changed and stops. If only one of those is present, it stops and does not replace the key. Replacing a key is a separate edit: delete the secret, delete the `governance-ci-signer` branch, and remove the signer line in a pull request the owner merges, then run Signer setup again.
+
+The owner does this once, in the GitHub website:
+
+1. Open [Fine-grained tokens](https://github.com/settings/personal-access-tokens/new). Name the token `governance-setup`. Resource owner is the account that owns the repository. Repository access is **Only select repositories**, and the repository is this one.
+2. Repository permissions: **Secrets** read and write, **Contents** read and write, **Pull requests** read and write. Generate the token. GitHub shows it once. This is the only value the owner copies.
+3. In the repository, open **Settings**, **Secrets and variables**, **Actions**, **New repository secret**. Name: `GOVERNANCE_SETUP_TOKEN`. Value: the token from the previous step.
+4. Open the **Actions** tab, choose **Signer setup**, **Run workflow**, branch **main**, and run it. The first push of the workflow fails with these same instructions when the secret is not there yet. The manual run is the one that creates the key.
+5. The workflow stores the private key as `GOVERNANCE_VERDICT_KEY` and opens a pull request that adds this line to `.governance/verdict-signers`:
 
 ```text
 governance-ci namespaces="governance-verdict" ssh-ed25519 <public key>
 ```
+
+6. Merging that pull request is the owner's approval of the public key. The workflow does not merge it. Until that merge, the gate does not trust the key, because it reads the signer list from the base branch. Signatures stay optional until `require_verdict_signature` is true on main.
 
 This separates checkouts, not identities. On one machine it proves the work was committed and passes in a clean worktree. Across machines it proves a clean checkout of that commit passed the frozen checks, and it records the live drive the checker claims. It still cannot prove a different agent ran the command.
 
