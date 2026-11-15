@@ -134,9 +134,9 @@ not tell you the right design.
 | Piece | What it does |
 |---|---|
 | `stagectl close` | Also writes `.governance/receipts/<stage>.json`: intent, acceptance, checks, verdict, and the Git tree ID of the code that was proven |
-| `stagectl gate` | Passes only when a committed receipt names the tree being checked. `--base` passes a change that touches no governed file. `--rerun` runs the receipt's checks again. `--markdown` writes the receipt for the pull request or the CI summary |
+| `stagectl gate` | Passes only when a committed receipt names the tree being checked. When that receipt's review is `independent`, a committed verdict must name the same tree. `--base` passes a change that touches no governed file. `--rerun` runs the receipt's checks again. `--markdown` writes the receipt for the pull request or the CI summary |
 
-The tree ID leaves out Git-ignored files, receipts, contract drafts under
+The tree ID leaves out Git-ignored files, receipts, verdicts, contract drafts under
 `.governance/stages/` and the configured exempt paths. Any other edit after close
 changes it, so the gate fails until a new stage proves the new code.
 
@@ -165,16 +165,31 @@ scripts/stagectl --repo . close
 
 | Piece | What it does |
 |---|---|
-| `skills/verify-stage` | A second agent checks out the exact commit in its own worktree, drives the app itself, tries to break it, and records PASS or FAIL |
+| `skills/verify-stage` | A second agent checks out the exact commit, drives the app itself, tries to break it, and records PASS or FAIL |
 | `skills/interrogate`, `skills/arena` | pstack's adversarial review: several agents try to break a change, and only findings proven by a run survive |
-| `stagectl verify` | Refuses the author's worktree, requires the verifier's checkout to match the author's code exactly, and reruns every frozen check there. A contract with `"review": "independent"` cannot close without a passing verdict on the current code |
+| `stagectl verify` | Refuses the author's worktree. On the same clone, a linked worktree must match the author's code exactly, and the verdict stays in local stage state. On another clone, which has no stage state, `--contract` reruns the frozen checks and writes a committed verdict |
+
+Same clone, linked worktree:
 
 ```bash
 scripts/stagectl --repo ../verifier-worktree verify --stage ST-... --outcome pass --summary "..."
 ```
 
-This separates checkouts, not identities: it proves the work was committed and passes
-in a clean tree, and it cannot prove a different agent ran the command.
+Another machine, its own clone of the commit under judgment. Commit the file it writes and push it back; the author pulls, reruns `stagectl run-check --all` (the new commit moved HEAD), then `stagectl close`.
+
+```bash
+scripts/stagectl --repo . verify --stage ST-... --contract .governance/stages/<short-name>.json \
+  --outcome pass --summary "Drove the totals form and saw thirty" \
+  --checker "other-vm" --control verify-<app> --live totals=1=verified
+```
+
+`--live` repeats once per feature-map entry, as `feature=entry=verified|failed|unreachable`. `--control` names the control skill or other driver used on the live app. Both may be omitted; the summary is required either way. Screenshots and recordings stay under the git-ignored `.verify/` directory.
+
+The committed record is `.governance/verdicts/<record_sha256>.json`. It names who checked (`checker`), which head (`head.commit` and the governed `head.tree`), which checks ran and how they finished (`checked`), and what was seen (`evidence`). `report` is `PASS`, `FAIL`, or `INVALID`. `record_sha256` is the hash of the other fields, and the file name is that hash.
+
+`stagectl gate` recomputes the governed tree and reads the contract file the verdict names. It rejects a missing verdict, a verdict whose hash does not match its contents, a verdict for a different tree, a verdict whose commit does not contain that tree, a verdict whose contract file changed, and a verdict that is missing a required field. The hash binds those fields together. It proves what the record says was checked. It does not prove who ran the command: anyone who can commit can write a new file with a new hash. Signing the checker is a follow-up. A rebase that keeps the same patch but changes the tree needs a new verdict; carrying an old verdict across a rebase by patch id is a separate follow-up.
+
+This separates checkouts, not identities. On one machine it proves the work was committed and passes in a clean worktree. Across machines it proves a clean checkout of that commit passed the frozen checks, and it records the live drive the checker claims. It still cannot prove a different agent ran the command.
 
 Ported from the earlier `governance-system` stage contracts, without policy versions,
 approval-record files, discovery notes or impact review. The owner approves once at
@@ -196,7 +211,7 @@ grant is recorded and the terminal remains the way to approve. A stage in anothe
 worktree (as `/implement-spec` uses) is not covered by `/approve` yet. A passing check does
 not prove the check covers its acceptance item. Environment, services and toolchain
 versions are not part of the fingerprint. Reopening a closed stage is not implemented.
-State is local to the machine (`<git-common-dir>/governance-v3/`). The three scripts
+Stage state is local to the machine (`<git-common-dir>/governance-v3/`), which is why a verdict used to be invisible to another clone. The receipt and the independent verdict are the records that are committed. The three scripts
 run on Linux, macOS and Windows; on Windows invoke them as `python <path>`.
 
 ### Entry point, hooks and install

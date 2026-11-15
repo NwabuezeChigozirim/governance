@@ -7,13 +7,15 @@ status     read-only readiness report
 close      close the stage; succeeds only when every receipt is current, and
            writes a receipt to .governance/receipts/ for the pull request
 gate       merge gate: pass only when a committed receipt proves this exact code
-verify     independent verdict: rerun the checks from a different worktree
+verify     independent verdict: rerun the checks from another worktree, or from
+           another clone when that clone has no local stage state
 revise     replace the contract with an owner-approved successor
 cancel     abandon the stage without completing it
 
 One stage per worktree, so parallel agents in separate worktrees do not collide.
-State lives under <git-common-dir>/governance-v3/. The receipt is the one record
-that is committed, so CI and reviewers can see what was proven. Standard library and Git only;
+Stage state lives under <git-common-dir>/governance-v3/ and does not travel with a
+clone. The receipt and the independent verdict are the records that are committed,
+so another machine and CI can check them. Standard library and Git only;
 Linux, macOS and Windows.
 Exit codes: 0 ok, 2 invalid invocation, 3 checks failed or stale, 4 owner approval needed.
 """
@@ -47,7 +49,10 @@ _loader.exec_module(verifyctl)
 
 CONFIG = ".governance/config.json"
 RECEIPTS = ".governance/receipts"
-ALWAYS_EXEMPT = (RECEIPTS + "/**", ".governance/stages/**")
+VERDICTS = ".governance/verdicts"
+ALWAYS_EXEMPT = (RECEIPTS + "/**", ".governance/stages/**", VERDICTS + "/**")
+LIVE_OUTCOMES = ("verified", "failed", "unreachable")
+REPORTS = {"pass": "PASS", "fail": "FAIL", "invalid": "INVALID"}
 RULES = ".governance/rules.json"
 BASELINE = ".governance/baseline.json"
 ALWAYS_PROTECTED = (RULES, "ruff.toml", ".ruff.toml", "mypy.ini", ".mypy.ini", "eslint.config.*", ".eslintrc*",
@@ -233,7 +238,7 @@ def governed_tree(root: Path, ref: str | None = None) -> str:
     """Git tree ID of the governed content: the worktree, or a commit when ref is given.
 
     Built in a throwaway index, so the real index is untouched. Git-ignored files,
-    receipts, contract drafts, configured exempt paths and Python caches are left out. Git applies its
+    receipts, verdicts, contract drafts, configured exempt paths and Python caches are left out. Git applies its
     own line-ending rules, so the same content gives the same ID on every platform.
     """
     settings = config(root)
@@ -273,6 +278,256 @@ def receipts(root: Path) -> list[dict[str, Any]]:
     return found
 
 
+def sha256_text(value: str, length: int) -> bool:
+    return bool(re.fullmatch(rf"[0-9a-f]{{{length}}}", value))
+
+
+def object_name(value: Any) -> bool:
+    """A Git object id: SHA-1 is 40 hex digits, SHA-256 is 64."""
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value))
+
+
+def checker_identity(root: Path, given: str | None) -> str:
+    """Who recorded the verdict. A name, not a signature."""
+    if given is not None:
+        text = given.strip()
+        if len(text) < 3 or VAGUE.match(text) or any(mark in text for mark in ("\n", "\r")):
+            raise Invalid("--checker must name who recorded the verdict")
+        return text
+    try:
+        name = git(root, "config", "user.name")
+        email = git(root, "config", "user.email")
+    except Invalid:
+        raise Invalid("pass --checker; git has no user.name and user.email in this clone") from None
+    text = f"{name} <{email}>"
+    if len(name.strip()) < 1 or len(email.strip()) < 3:
+        raise Invalid("pass --checker; git user.name and user.email are empty")
+    return text
+
+
+def parse_live(values: list[str]) -> list[dict[str, str]]:
+    """One feature-map entry the checker drove: feature=entry=verified|failed|unreachable."""
+    parsed = []
+    for value in values:
+        parts = value.split("=", 2)
+        if (len(parts) != 3 or not parts[0] or not parts[1].strip() or parts[2] not in LIVE_OUTCOMES
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", parts[0])):
+            raise Invalid("--live must be feature=entry=verified|failed|unreachable, "
+                          "with a feature-map id and the entry's number or text")
+        parsed.append({"feature": parts[0], "entry": parts[1].strip(), "outcome": parts[2]})
+    return parsed
+
+
+def verdict_body(stage_id: str, commit: str, tree: str, identity: str, contract: dict[str, Any],
+                 contract_path: str, checks: list[dict[str, Any]], summary: str, control: str | None,
+                 live: list[dict[str, str]], declared: str, outcome: str, recorded_at: str) -> dict[str, Any]:
+    """The committed verdict. Its shape is the independent check: who, which head, what ran, what was seen."""
+    return {
+        "version": 1,
+        "stage_id": stage_id,
+        "head": {"commit": commit, "tree": tree},
+        "checker": {"identity": identity},
+        "checked": {"contract_sha256": digest(contract), "contract_path": contract_path, "checks": checks},
+        "evidence": {"summary": summary.strip(), "control": control, "live": live},
+        "declared": declared,
+        "outcome": outcome,
+        "report": REPORTS[outcome],
+        "recorded_at": recorded_at,
+    }
+
+
+def publish_new(path: Path, value: Any) -> None:
+    """Create a content-addressed file. The same bytes are not an error; a different file at that name is."""
+    if path.is_file():
+        existing = read_json(path)
+        if existing != value:
+            raise Invalid(f"a different verdict is already stored at {path.name}")
+        return
+    publish(path, value)
+
+
+def matching_contract_path(root: Path, contract: dict[str, Any]) -> str | None:
+    """A tracked JSON file whose parsed contents are the frozen contract, if one is committed."""
+    target = digest(contract)
+    matches = []
+    for name in git(root, "ls-files", "-z").split("\0"):
+        if not name.endswith(".json"):
+            continue
+        path = root / name
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            value = read_json(path)
+        except Invalid:
+            continue
+        if isinstance(value, dict) and digest(value) == target:
+            matches.append(name)
+    return sorted(matches)[0] if matches else None
+
+
+def load_verdicts(root: Path) -> list[tuple[Path, Any]]:
+    directory = root / VERDICTS
+    if not directory.is_dir():
+        return []
+    found = []
+    for path in sorted(directory.glob("*.json")):
+        if path.is_symlink():
+            found.append((path, None))
+            continue
+        try:
+            found.append((path, read_json(path)))
+        except Invalid:
+            found.append((path, None))
+    return found
+
+
+def _nonempty(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and "\n" not in value and "\r" not in value
+
+
+def verdict_shape(path: Path, value: Any) -> list[dict[str, str]]:
+    """Hash and required fields. A mismatch is tampering; a hole is an unusable record."""
+    name = path.name
+    if not isinstance(value, dict) or not isinstance(value.get("record_sha256"), str):
+        return [{"code": "verdict-invalid", "message": f"{name}: not a verdict record"}]
+    body = {key: item for key, item in value.items() if key != "record_sha256"}
+    if value["record_sha256"] != digest(body) or path.stem != value["record_sha256"]:
+        return [{"code": "verdict-tampered", "message": f"{name}: record hash does not match its contents"}]
+    head, checker, checked, evidence = (value.get(key) for key in ("head", "checker", "checked", "evidence"))
+    checks = checked.get("checks") if isinstance(checked, dict) else None
+    live = evidence.get("live") if isinstance(evidence, dict) else None
+    control = evidence.get("control") if isinstance(evidence, dict) else ""
+    outcome = value.get("outcome")
+    stage = value.get("stage_id")
+    well = (value.get("version") == 1 and isinstance(stage, str) and re.fullmatch(r"ST-[0-9a-f]{32}", stage)
+            and isinstance(head, dict) and object_name(head.get("commit")) and object_name(head.get("tree"))
+            and isinstance(checker, dict) and _nonempty(checker.get("identity")) and not VAGUE.match(checker["identity"].strip())
+            and isinstance(checked, dict) and sha256_text(str(checked.get("contract_sha256", "")), 64)
+            and isinstance(checked.get("contract_path"), str) and checked["contract_path"]
+            and isinstance(checks, list) and checks
+            and isinstance(evidence, dict) and meaningful(evidence.get("summary"))
+            and (control is None or _nonempty(control))
+            and isinstance(live, list)
+            and outcome in REPORTS and value.get("declared") in ("pass", "fail")
+            and value.get("report") == REPORTS[outcome]
+            and isinstance(value.get("recorded_at"), str)
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value["recorded_at"]))
+    if not well or not _checks_well(checks) or not _live_well(live):
+        return [{"code": "verdict-invalid", "message": f"{name}: missing or unusable required field"}]
+    if outcome == "pass" and (any(item["status"] != "passed" or item["returncode"] != 0 for item in checks)
+                              or any(item["outcome"] == "failed" for item in live)):
+        return [{"code": "verdict-invalid", "message": f"{name}: a passing verdict records a check or a live entry that failed"}]
+    return []
+
+
+def _checks_well(checks: Any) -> bool:
+    if not isinstance(checks, list):
+        return False
+    for item in checks:
+        if not isinstance(item, dict):
+            return False
+        argv = item.get("argv")
+        status = item.get("status")
+        code = item.get("returncode")
+        if (not isinstance(item.get("check_id"), str) or not re.fullmatch(r"CHK-\d{3,}", item["check_id"])
+                or not isinstance(argv, list) or not argv or any(not isinstance(part, str) or not part for part in argv)
+                or status not in ("passed", "failed", "timed-out", "could-not-start")
+                or not (code is None or type(code) is int)
+                or not sha256_text(str(item.get("log_sha256", "")), 64)):
+            return False
+    return True
+
+
+def _live_well(live: Any) -> bool:
+    if not isinstance(live, list):
+        return False
+    for item in live:
+        if (not isinstance(item, dict) or set(item) != {"feature", "entry", "outcome"}
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(item.get("feature", "")))
+                or not isinstance(item.get("entry"), str) or not item["entry"].strip()
+                or item.get("outcome") not in LIVE_OUTCOMES):
+            return False
+    return True
+
+
+def verdict_binding(root: Path, value: dict[str, Any], tree: str) -> list[dict[str, str]]:
+    """Recompute the governed tree and the contract. The file's own claim is not evidence."""
+    name = value["record_sha256"][:12]
+    claimed = value["head"]["tree"]
+    if claimed != tree:
+        return [{"code": "verdict-tree", "message": f"verdict {name} names tree {claimed}, not the tree under review ({tree})"}]
+    try:
+        committed = governed_tree(root, value["head"]["commit"])
+    except Invalid:
+        return [{"code": "verdict-commit", "message": f"verdict {name} names a commit that is not in this clone"}]
+    if committed != claimed:
+        return [{"code": "verdict-commit", "message": f"verdict {name} names commit {value['head']['commit']}, "
+                                                      "whose governed tree is not the tree it records"}]
+    try:
+        contract = read_json(local_file(root, value["checked"]["contract_path"]))
+    except Invalid as exc:
+        return [{"code": "verdict-contract", "message": str(exc)}]
+    if not isinstance(contract, dict) or digest(contract) != value["checked"]["contract_sha256"]:
+        return [{"code": "verdict-contract", "message": f"verdict {name} does not match the contract file it names"}]
+    expected = [(item["id"], item["argv"]) for item in contract.get("checks", [])]
+    got = [(item["check_id"], item["argv"]) for item in value["checked"]["checks"]]
+    if got != expected:
+        return [{"code": "verdict-invalid", "message": f"verdict {name} did not record the contract's checks"}]
+    if value["outcome"] != "pass":
+        return [{"code": "verdict-failed", "message": f"independent verdict: {value['outcome']}; {value['evidence']['summary']}"}]
+    return []
+
+
+def choose_verdict(root: Path, stage_id: str, tree: str) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+    """A passing, intact verdict for this stage and this governed tree, plus why the others were not it."""
+    files = load_verdicts(root)
+    if not files:
+        return None, [{"code": "verdict-missing", "message": (
+            "no independent verdict is committed for this code. On another machine, check out the commit and run "
+            "'stagectl verify --stage " + stage_id + " --contract <contract> --outcome pass --summary ...', "
+            "then commit the file it writes under " + VERDICTS + "/")}]
+    chosen: dict[str, Any] | None = None
+    problems: list[dict[str, str]] = []
+    saw_stage = False
+    for path, value in files:
+        shape = verdict_shape(path, value)
+        if shape:
+            problems.extend(shape)
+            continue
+        if value["stage_id"] != stage_id:
+            continue
+        saw_stage = True
+        binding = verdict_binding(root, value, tree)
+        if binding:
+            problems.extend(binding)
+            continue
+        chosen = value
+    if chosen:
+        return chosen, []
+    if not saw_stage and not any(item["code"] in {"verdict-tampered", "verdict-invalid"} for item in problems):
+        return None, [{"code": "verdict-missing", "message": f"no committed verdict for stage {stage_id}"}]
+    return None, problems
+
+
+INSPECT_VERDICT = {
+    "verdict-missing": ("review-missing", "no independent verdict yet; run 'stagectl verify' from a different worktree or clone"),
+    "verdict-tampered": ("evidence-corrupt", "the independent verdict record was altered"),
+    "verdict-invalid": ("evidence-corrupt", "the independent verdict record is missing required fields"),
+    "verdict-tree": ("review-stale", "the independent verdict is for a different tree; verify again"),
+    "verdict-commit": ("review-stale", "the independent verdict's commit does not contain the tree it names"),
+    "verdict-contract": ("review-stale", "the independent verdict does not match the frozen contract"),
+    "verdict-failed": ("review-failed", "independent verdict did not pass"),
+}
+
+
+def as_review(problems: list[dict[str, str]]) -> list[dict[str, str]]:
+    mapped = []
+    for item in problems:
+        code, message = INSPECT_VERDICT.get(item["code"], ("evidence-corrupt", item["message"]))
+        mapped.append({"code": code, "message": message})
+    return mapped
+
+
 def receipt_markdown(receipt: dict[str, Any]) -> str:
     lines = [f"### Stage receipt: {receipt['name']}", "", f"**Intent.** {receipt['intent']}", "",
              f"Stage `{receipt['stage_id']}`, closed {receipt['closed_at']}, proven on tree `{receipt['tree']}`.", "",
@@ -283,8 +538,13 @@ def receipt_markdown(receipt: dict[str, Any]) -> str:
     for check in receipt["checks"]:
         lines.append(f"| {check['id']} | `{' '.join(check['argv'])}` | passed |")
     verdict = receipt.get("verdict")
-    lines += ["", f"**Independent verdict.** {verdict['outcome']}: {verdict['summary']}" if verdict
-              else "**Independent verdict.** Not required by this contract."]
+    if verdict:
+        line = f"**Independent verdict.** {verdict['outcome']}: {verdict['summary']}"
+        if verdict.get("record_sha256"):
+            line += f" Record `{VERDICTS}/{verdict['record_sha256']}.json`."
+        lines += ["", line]
+    else:
+        lines += ["", "**Independent verdict.** Not required by this contract."]
     return "\n".join(lines) + "\n"
 
 
@@ -303,6 +563,15 @@ def gate(root: Path, base: str | None, rerun: bool) -> dict[str, Any]:
             "Either the change was made outside a stage, or files changed after the stage closed. "
             "Run the change through a stage and commit the receipt it writes.")}]}
     result: dict[str, Any] = {"passed": True, "tree": tree, "stage_id": receipt["stage_id"], "receipt": receipt}
+    if receipt.get("review") == "independent":
+        # The receipt says a second person judged this tree. The committed verdict is that judgment;
+        # the receipt's own summary is not re-checked here.
+        chosen, issues = choose_verdict(root, receipt["stage_id"], tree)
+        if not chosen:
+            result["passed"] = False
+            result["problems"] = issues
+            return result
+        result["verdict"] = chosen["record_sha256"]
     if rerun:
         results = []
         with tempfile.TemporaryDirectory(prefix="governance-gate-") as logs:
@@ -506,13 +775,24 @@ def inspect(root: Path) -> dict[str, Any]:
         verdicts = sorted((directory / "verdicts").glob("*/verdict.json"))
         verdict = read_json(verdicts[-1]) if verdicts else None
         if not verdict:
-            issue("review-missing", "no independent verdict yet; run 'stagectl verify' from a different worktree")
+            issue("review-missing", "no independent verdict yet; run 'stagectl verify' from a different worktree or clone")
         elif verdict.get("record_sha256") != digest({k: v for k, v in verdict.items() if k != "record_sha256"}):
             issue("evidence-corrupt", "the independent verdict record was altered")
         elif verdict["contract_sha256"] != pointer["contract_sha256"] or verdict["subject"] != current:
             issue("review-stale", "the code changed after the independent verdict; verify again")
         elif verdict["outcome"] != "pass":
             issue("review-failed", f"independent verdict: {verdict['outcome']}; {verdict['summary']}")
+        # A committed verdict from another clone has no local record. It satisfies the review when it
+        # binds to this frozen contract and the governed tree under review.
+        chosen, issues = choose_verdict(root, pointer["stage_id"], governed_tree(root))
+        if chosen and chosen["checked"]["contract_sha256"] == digest(contract):
+            problems[:] = [item for item in problems
+                           if item["code"] not in {"review-missing", "review-stale", "review-failed"}
+                           and item["message"] != "the independent verdict record was altered"]
+            verdict = chosen
+        elif any(item["code"] == "review-missing" for item in problems):
+            problems[:] = [item for item in problems if item["code"] != "review-missing"]
+            problems.extend(as_review(issues))
     return {"stage_id": pointer["stage_id"], "name": contract["name"], "intent": contract["intent"],
             "review": contract["review"], "verdict": digest(verdict) if verdict else None,
             "ready": not problems, "problems": problems, "evidence": evidence, "subject": current,
@@ -585,17 +865,25 @@ def run_checks(root: Path, identifier: str | None) -> dict[str, Any]:
     return {"results": results, "passed": all(r["status"] == "passed" for r in results)}
 
 
-def verify(root: Path, stage_id: str, outcome: str, summary: str) -> dict[str, Any]:
-    """Record an independent verdict from a worktree other than the author's.
+def verify(root: Path, stage_id: str, outcome: str, summary: str, contract_path: str | None = None,
+           checker: str | None = None, control: str | None = None, live: list[str] | None = None) -> dict[str, Any]:
+    """Record an independent verdict.
 
-    The verifier's checkout must hold exactly the author's code, which forces the work
-    to be committed, and every frozen check is rerun there. Only a verifier that
-    declares pass, with every rerun passing, yields a passing verdict.
+    On the author's clone, stage state is in the git common dir, so a linked worktree records
+    the verdict there. Another machine has its own git common dir and no stage state: it passes
+    ``--contract`` and writes a committed verdict under ``.governance/verdicts/``.
     """
     if not re.fullmatch(r"ST-[0-9a-f]{32}", stage_id):
         raise Invalid("--stage must be a stage ID such as ST-...")
     if not meaningful(summary):
         raise Invalid("--summary must say what was driven and what was observed")
+    if (state_dir(root) / "stages" / stage_id / "contract.json").is_file():
+        return verify_local(root, stage_id, outcome, summary)
+    return verify_portable(root, stage_id, outcome, summary, contract_path, checker, control, live or [])
+
+
+def verify_local(root: Path, stage_id: str, outcome: str, summary: str) -> dict[str, Any]:
+    """Same-clone path: the author's stage state is in this git common dir."""
     with locked(root):
         directory = state_dir(root) / "stages" / stage_id
         envelope = read_json(directory / "contract.json")
@@ -627,7 +915,7 @@ def verify(root: Path, stage_id: str, outcome: str, summary: str) -> dict[str, A
         if subject(root, contract) != before:
             final = "invalid"
             summary = "the verifier's worktree changed while the checks ran; " + summary
-        elif any(r["status"] != "passed" for r in results):
+        elif any(item["status"] != "passed" for item in results):
             final = "fail"
         else:
             final = outcome
@@ -639,6 +927,83 @@ def verify(root: Path, stage_id: str, outcome: str, summary: str) -> dict[str, A
     return {"stage_id": stage_id, "outcome": final, "results": results, "verdict": str(home / "verdict.json")}
 
 
+def verify_portable(root: Path, stage_id: str, outcome: str, summary: str, contract_path: str | None,
+                    checker: str | None, control: str | None, live_args: list[str]) -> dict[str, Any]:
+    """Other-clone path: bind a verdict to the committed tree and write it where git will carry it."""
+    if not contract_path:
+        raise Invalid("this clone has no local stage state for that id. Stage state lives under the git "
+                      "common dir and does not travel with a clone. Pass --contract, the committed contract, "
+                      "on a checkout of the commit being judged")
+    live = parse_live(live_args)
+    identity = checker_identity(root, checker)
+    if control is not None:
+        control = control.strip()
+        if not _nonempty(control):
+            raise Invalid("--control must name the control skill or the driver used on the live app")
+    with locked(root):
+        value = read_json(local_file(root, contract_path))
+        if not isinstance(value, dict):
+            raise Invalid(f"contract not found: {contract_path}")
+        errors = contract_errors(value)
+        if errors:
+            raise Invalid("; ".join(errors))
+        if value["review"] != "independent":
+            raise Invalid("this stage's contract does not call for an independent verdict")
+        tree = governed_tree(root)
+        if governed_tree(root, "HEAD") != tree:
+            raise Invalid("commit the code under judgment first; this checkout's governed files differ from HEAD")
+        commit = git(root, "rev-parse", "HEAD")
+        with tempfile.TemporaryDirectory(prefix="governance-verdict-") as logs:
+            results = []
+            for check in value["checks"]:
+                log = Path(logs) / f"{check['id']}.log"
+                code, status = execute(root, check, log)
+                results.append({"check_id": check["id"], "argv": check["argv"], "status": status, "returncode": code,
+                                "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest()})
+        if governed_tree(root) != tree:
+            final = "invalid"
+            summary = "the verifier's checkout changed while the checks ran; " + summary
+        elif any(item["status"] != "passed" for item in results) or any(item["outcome"] == "failed" for item in live):
+            final = "fail"
+        else:
+            final = outcome
+        body = verdict_body(stage_id, commit, tree, identity, value, contract_path, results, summary, control, live,
+                            outcome, final, now())
+        body["record_sha256"] = digest(body)
+        path = root / VERDICTS / f"{body['record_sha256']}.json"
+        publish_new(path, body)
+    return {"stage_id": stage_id, "outcome": final, "results": results, "verdict": str(path),
+            "tree": tree, "commit": commit, "record_sha256": body["record_sha256"]}
+
+
+def seal_local_verdict(root: Path, stage_id: str, contract: dict[str, Any], local: dict[str, Any],
+                       tree: str) -> dict[str, Any] | None:
+    """Copy a same-clone pass into the committed verdict, when the code under judgment is already committed."""
+    if local.get("outcome") != "pass":
+        return None
+    try:
+        if governed_tree(root, "HEAD") != tree:
+            return None
+    except Invalid:
+        return None
+    contract_path = matching_contract_path(root, contract)
+    if contract_path is None:
+        return None
+    argv = {item["id"]: item["argv"] for item in contract["checks"]}
+    checks = []
+    for item in local["checks"]:
+        if item["check_id"] not in argv:
+            return None
+        checks.append({"check_id": item["check_id"], "argv": argv[item["check_id"]], "status": item["status"],
+                       "returncode": item["returncode"], "log_sha256": item["log_sha256"]})
+    body = verdict_body(stage_id, git(root, "rev-parse", "HEAD"), tree, str(local["verifier_worktree"]), contract,
+                        contract_path, checks, local["summary"], None, [], local["declared"], local["outcome"],
+                        local["recorded_at"])
+    body["record_sha256"] = digest(body)
+    publish_new(root / VERDICTS / f"{body['record_sha256']}.json", body)
+    return body
+
+
 def close(root: Path) -> dict[str, Any]:
     with locked(root):
         report = inspect(root)
@@ -648,12 +1013,26 @@ def close(root: Path) -> dict[str, Any]:
         closure = {key: report[key] for key in ("stage_id", "contract_sha256", "subject", "evidence", "verdict")}
         closure["closed_at"] = now()
         contract = read_json(directory / "contract.json")["contract"]
-        verdicts = sorted((directory / "verdicts").glob("*/verdict.json"))
-        verdict = read_json(verdicts[-1]) if verdicts and contract["review"] == "independent" else None
+        tree = governed_tree(root)
+        recorded: dict[str, Any] | None = None
+        if contract["review"] == "independent":
+            chosen, _issues = choose_verdict(root, report["stage_id"], tree)
+            if chosen and chosen["checked"]["contract_sha256"] == digest(contract):
+                recorded = {"outcome": chosen["outcome"], "summary": chosen["evidence"]["summary"],
+                            "record_sha256": chosen["record_sha256"]}
+            else:
+                local_files = sorted((directory / "verdicts").glob("*/verdict.json"))
+                local = read_json(local_files[-1]) if local_files else None
+                sealed = seal_local_verdict(root, report["stage_id"], contract, local, tree) if local else None
+                if sealed:
+                    recorded = {"outcome": sealed["outcome"], "summary": sealed["evidence"]["summary"],
+                                "record_sha256": sealed["record_sha256"]}
+                elif local:
+                    recorded = {"outcome": local["outcome"], "summary": local["summary"]}
         receipt = {"version": 1, "stage_id": report["stage_id"], "name": contract["name"],
                    "intent": contract["intent"], "review": contract["review"], "acceptance": contract["acceptance"],
-                   "checks": contract["checks"], "tree": governed_tree(root), "closed_at": closure["closed_at"],
-                   "verdict": {"outcome": verdict["outcome"], "summary": verdict["summary"]} if verdict else None}
+                   "checks": contract["checks"], "tree": tree, "closed_at": closure["closed_at"],
+                   "verdict": recorded}
         publish(directory / "closure.json", closure)
         write_json(root / RECEIPTS / f"{report['stage_id']}.json", receipt)
         pointer_path(root).unlink()
@@ -693,6 +1072,11 @@ def main() -> int:
     verify_parser.add_argument("--stage", required=True, help="stage ID reported by the author's freeze or status")
     verify_parser.add_argument("--outcome", required=True, choices=["pass", "fail"])
     verify_parser.add_argument("--summary", required=True)
+    verify_parser.add_argument("--contract", help="committed contract; required on a clone that has no local stage state")
+    verify_parser.add_argument("--checker", help="who is recording the verdict; defaults to git user.name and user.email")
+    verify_parser.add_argument("--control", help="control skill or other driver used on the live app")
+    verify_parser.add_argument("--live", action="append", default=[],
+                               help="feature=entry=verified|failed|unreachable for one feature-map entry driven live")
     commands.add_parser("close")
     commands.add_parser("cancel").add_argument("--reason", required=True)
     gate_parser = commands.add_parser("gate")
@@ -713,7 +1097,8 @@ def main() -> int:
             result = inspect(root)
             code = 0 if result["ready"] else 3
         elif args.command == "verify":
-            result = verify(root, args.stage, args.outcome, args.summary)
+            result = verify(root, args.stage, args.outcome, args.summary, args.contract, args.checker,
+                            args.control, args.live)
             code = 0 if result["outcome"] == "pass" else 3
         elif args.command == "close":
             result = close(root)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -12,6 +13,10 @@ import unittest
 
 
 STAGECTL = Path(__file__).resolve().parents[1] / "scripts" / "stagectl"
+
+
+def canon(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def contract(**changes) -> dict:
@@ -201,6 +206,9 @@ class StagectlTests(unittest.TestCase):
         code, out = self.verify(other, stage)
         self.assertEqual(code, 0, out)
         self.assertEqual(self.ctl("close")[0], 0)
+        verdicts = list((self.repo / ".governance" / "verdicts").glob("*.json"))
+        self.assertEqual(len(verdicts), 1)
+        self.assertEqual(self.ctl("gate")[0], 0)
 
     def test_verifier_must_hold_the_authors_exact_code(self) -> None:
         stage, other = self.reviewed_stage()
@@ -338,6 +346,115 @@ class StagectlTests(unittest.TestCase):
     def test_invalid_config_is_refused(self) -> None:
         self.write(".governance/config.json", json.dumps({"require_stage": "yes"}))
         self.assertEqual(self.ctl("gate")[0], 2)
+
+    def test_a_verdict_recorded_on_another_clone_is_accepted_and_a_bad_one_is_not(self) -> None:
+        self.write("stage.json", json.dumps(contract(review="independent")))
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "contract")
+        code, frozen = self.ctl("freeze", "--contract", "stage.json", "--owner-approved")
+        self.assertEqual(code, 0, frozen)
+        self.assertEqual(self.ctl("run-check", "--all")[0], 0)
+        stage = frozen["stage_id"]
+        judged = self.git_out("rev-parse", "HEAD")
+        remote = self.repo.parent / (self.repo.name + "-remote.git")
+        checker = self.repo.parent / (self.repo.name + "-checker")
+        self.addCleanup(shutil.rmtree, remote, True)
+        self.addCleanup(shutil.rmtree, checker, True)
+        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        self.git("remote", "add", "origin", str(remote))
+        self.git("push", "-q", "-u", "origin", "HEAD")
+        subprocess.run(["git", "clone", "-q", str(remote), str(checker)], check=True)
+        author_common = self.common_dir(self.repo)
+        checker_common = self.common_dir(checker)
+        self.assertNotEqual(author_common, checker_common)
+        self.assertFalse((checker_common / "governance-v3" / "stages" / stage).exists())
+
+        refused = self.verify_at(checker, stage)
+        self.assertEqual(refused[0], 2)
+        self.assertIn("no local stage state", refused[1]["error"])
+        (checker / "app.py").write_text("def total(days, rate):\n    return 0\n", encoding="utf-8")
+        dirty = self.verify_at(checker, stage, "--contract", "stage.json", "--checker", "other-vm")
+        self.assertEqual(dirty[0], 2)
+        self.assertIn("differ from HEAD", dirty[1]["error"])
+        subprocess.run(["git", "-C", str(checker), "checkout", "-q", "--", "app.py"], check=True)
+
+        code, recorded = self.verify_at(
+            checker, stage, "--contract", "stage.json", "--checker", "other-vm", "--control", "check.py",
+            "--live", "totals=1=verified")
+        self.assertEqual(code, 0, recorded)
+        verdict_path = checker / recorded["verdict"]
+        body = json.loads(verdict_path.read_text(encoding="utf-8"))
+        self.assertEqual(body["head"]["commit"], judged)
+        self.assertEqual(body["checker"]["identity"], "other-vm")
+        self.assertEqual(body["report"], "PASS")
+        self.assertEqual(body["checked"]["checks"][0]["status"], "passed")
+        self.assertEqual(body["evidence"]["control"], "check.py")
+        self.assertEqual(body["evidence"]["live"], [{"feature": "totals", "entry": "1", "outcome": "verified"}])
+        self.assertEqual(body["record_sha256"], canon({k: v for k, v in body.items() if k != "record_sha256"}))
+        self.assertEqual(verdict_path.name, body["record_sha256"] + ".json")
+
+        self.git_at(checker, "add", "-A")
+        self.git_at(checker, "commit", "-q", "-m", "verdict")
+        self.git_at(checker, "push", "-q")
+        self.git("pull", "-q", "--ff-only")
+        status = self.ctl("status")[1]
+        self.assertNotIn("review-missing", self.codes(status))
+        self.assertIn("check-stale", self.codes(status))
+        self.assertEqual(self.ctl("run-check", "--all")[0], 0)
+        code, closed = self.ctl("close")
+        self.assertEqual(code, 0, closed)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "receipt")
+        code, gated = self.ctl("gate")
+        self.assertEqual(code, 0, gated)
+        self.assertEqual(gated["verdict"], body["record_sha256"])
+
+        original = (self.repo / ".governance" / "verdicts" / verdict_path.name).read_text(encoding="utf-8")
+        tampered = json.loads(original)
+        tampered["evidence"]["summary"] = "rewritten after the fact without a new hash"
+        (self.repo / ".governance" / "verdicts" / verdict_path.name).write_text(json.dumps(tampered), encoding="utf-8")
+        self.assertEqual(self.codes(self.ctl("gate")[1]), {"verdict-tampered"})
+
+        shifted = json.loads(original)
+        shifted["head"] = {**shifted["head"], "tree": "0" * 40}
+        shifted["record_sha256"] = canon({k: v for k, v in shifted.items() if k != "record_sha256"})
+        directory = self.repo / ".governance" / "verdicts"
+        for path in directory.glob("*.json"):
+            path.unlink()
+        (directory / f"{shifted['record_sha256']}.json").write_text(json.dumps(shifted), encoding="utf-8")
+        self.assertEqual(self.codes(self.ctl("gate")[1]), {"verdict-tree"})
+
+        incomplete = json.loads(original)
+        del incomplete["checker"]
+        incomplete["record_sha256"] = canon({k: v for k, v in incomplete.items() if k != "record_sha256"})
+        for path in directory.glob("*.json"):
+            path.unlink()
+        (directory / f"{incomplete['record_sha256']}.json").write_text(json.dumps(incomplete), encoding="utf-8")
+        self.assertEqual(self.codes(self.ctl("gate")[1]), {"verdict-invalid"})
+
+        for path in directory.glob("*.json"):
+            path.unlink()
+        self.assertEqual(self.codes(self.ctl("gate")[1]), {"verdict-missing"})
+
+    def git_out(self, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def git_at(self, repo: Path, *args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+                       check=True, capture_output=True)
+
+    def common_dir(self, repo: Path) -> Path:
+        raw = subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        path = Path(raw)
+        return path if path.is_absolute() else (repo / path).resolve()
+
+    def verify_at(self, repo: Path, stage: str, *extra: str) -> tuple[int, dict]:
+        result = subprocess.run(
+            [sys.executable, "-B", str(STAGECTL), "--repo", str(repo), "--json", "verify", "--stage", stage,
+             "--outcome", "pass", "--summary", "Drove totals through the CLI and saw thirty", *extra],
+            capture_output=True, text=True, check=False)
+        return result.returncode, json.loads(result.stdout)
 
 
 if __name__ == "__main__":
