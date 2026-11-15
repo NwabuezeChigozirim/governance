@@ -776,6 +776,116 @@ class StagectlTests(unittest.TestCase):
         self.assertIn("verdict-failed", self.codes(blocked))
         self.assertFalse(blocked["passed"])
 
+    def test_reproof_plan_runs_only_when_the_tree_moved_and_the_patch_is_unchanged(self) -> None:
+        self.git("branch", "-M", "main")
+        self.write("stage.json", json.dumps(contract(review="independent")))
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "contract")
+        self.git("checkout", "-q", "-b", "feature")
+        self.write("app.py", "def total(days, rate):\n    if days < 0:\n        raise ValueError('days')\n    return days * rate\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "reject negative days")
+        code, frozen = self.ctl("freeze", "--contract", "stage.json", "--owner-approved")
+        self.assertEqual(code, 0, frozen)
+        self.assertEqual(self.ctl("run-check", "--all")[0], 0)
+        stage = frozen["stage_id"]
+        remote = self.repo.parent / (self.repo.name + "-plan-remote.git")
+        checker = self.repo.parent / (self.repo.name + "-plan-checker")
+        self.addCleanup(shutil.rmtree, remote, True)
+        self.addCleanup(shutil.rmtree, checker, True)
+        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(remote), "symbolic-ref", "HEAD", "refs/heads/feature"], check=True)
+        self.git("remote", "add", "origin", str(remote))
+        self.git("push", "-q", "-u", "origin", "main")
+        self.git("push", "-q", "-u", "origin", "feature")
+        subprocess.run(["git", "clone", "-q", str(remote), str(checker)], check=True)
+        self.assertNotEqual(self.common_dir(self.repo), self.common_dir(checker))
+        code, recorded = self.verify_at(checker, stage, "--contract", "stage.json", "--checker", "other-vm")
+        self.assertEqual(code, 0, recorded)
+        first = json.loads((checker / recorded["verdict"]).read_text(encoding="utf-8"))
+        self.git_at(checker, "add", "-A")
+        self.git_at(checker, "commit", "-q", "-m", "verdict")
+        self.git_at(checker, "push", "-q")
+        self.git("pull", "-q", "--ff-only")
+        code, plan = self.plan_at(checker, "origin/main")
+        self.assertEqual(code, 0, plan)
+        self.assertEqual(plan["action"], "skip", plan)
+        (checker / ".governance").mkdir(exist_ok=True)
+        (checker / ".governance" / "config.json").write_text('{"require_verdict_signature": true}\n', encoding="utf-8")
+        self.git_at(checker, "add", "-A")
+        self.git_at(checker, "commit", "-q", "-m", "require a signature")
+        code, unsigned = self.reprove_at(checker, stage, first["record_sha256"], "origin/main",
+                                         "--checker", "governance-ci")
+        self.assertEqual(code, 2, unsigned)
+        self.assertIn("signed verdict", unsigned["error"])
+        code, deferred_early = self.reprove_at(checker, stage, first["record_sha256"], "origin/main",
+                                               "--checker", "governance-ci", "--defer-signature")
+        self.assertEqual(code, 2, deferred_early)
+        self.assertNotIn("signed verdict", deferred_early["error"])
+        self.git_at(checker, "reset", "-q", "--hard", "origin/feature")
+        self.git("checkout", "-q", "main")
+        self.write("notes.md", "moved\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "move main")
+        self.git("push", "-q")
+        self.git("checkout", "-q", "feature")
+        self.git("rebase", "-q", "main")
+        self.git("push", "-q", "--force-with-lease")
+        self.git_at(checker, "fetch", "-q", "origin")
+        self.git_at(checker, "reset", "-q", "--hard", "origin/feature")
+        code, plan = self.plan_at(checker, "origin/main")
+        self.assertEqual(plan["action"], "reprove", plan)
+        self.assertEqual(plan["supersedes"], first["record_sha256"])
+        self.assertEqual(plan["checker"], "governance-ci")
+        (checker / "app.py").write_text(
+            "def total(days, rate):\n    if days < 0:\n        raise ValueError('days')\n    return days * rate + 1\n",
+            encoding="utf-8")
+        self.git_at(checker, "add", "-A")
+        self.git_at(checker, "commit", "-q", "-m", "different patch")
+        code, changed = self.plan_at(checker, "origin/main")
+        self.assertEqual(changed["action"], "skip", changed)
+        self.assertIn("patch-id", changed["reason"])
+        self.git_at(checker, "reset", "-q", "--hard", "origin/feature")
+        forged = {
+            "version": 1, "stage_id": stage, "head": {"commit": "a" * 40, "tree": plan["tree"]},
+            "checker": {"identity": "other-vm"},
+            "checked": first["checked"], "evidence": first["evidence"],
+            "declared": "fail", "outcome": "fail", "report": "FAIL", "recorded_at": "2026-08-02T00:00:00Z",
+        }
+        forged["record_sha256"] = canon({k: v for k, v in forged.items() if k != "record_sha256"})
+        path = checker / ".governance" / "verdicts" / f"{forged['record_sha256']}.json"
+        path.write_text(json.dumps(forged), encoding="utf-8")
+        self.git_at(checker, "add", "-A")
+        self.git_at(checker, "commit", "-q", "-m", "failed verdict for this tree")
+        code, again = self.plan_at(checker, "origin/main")
+        self.assertEqual(again["action"], "skip", again)
+        self.assertIn("already exists", again["reason"])
+        path.unlink()
+        self.git_at(checker, "add", "-A")
+        self.git_at(checker, "commit", "-q", "-m", "remove the failed verdict")
+        code, ready = self.plan_at(checker, "origin/main")
+        self.assertEqual(ready["action"], "reprove", ready)
+        code, deferred = self.reprove_at(checker, stage, first["record_sha256"], "origin/main",
+                                         "--checker", "governance-ci", "--defer-signature")
+        self.assertEqual(code, 0, deferred)
+        self.assertFalse(deferred["signed"])
+        verdict = checker / ".governance" / "verdicts" / f"{deferred['record_sha256']}.json"
+        self.assertTrue(verdict.is_file())
+        self.assertFalse(verdict.with_suffix(".sig").exists())
+        key_dir = Path(tempfile.mkdtemp(prefix="ci-key-"))
+        self.addCleanup(shutil.rmtree, key_dir, True)
+        key = self.make_key(key_dir, "verdict-key")
+        signed = subprocess.run(
+            [sys.executable, "-B", str(STAGECTL), "--repo", str(checker), "--json", "sign-verdict",
+             "--record", deferred["record_sha256"], "--key", str(key)],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(signed.returncode, 0, signed.stdout or signed.stderr)
+        self.assertTrue(verdict.with_suffix(".sig").is_file())
+        self.git_at(checker, "add", "-A")
+        self.git_at(checker, "commit", "-q", "-m", "reproof")
+        code, done = self.plan_at(checker, "origin/main")
+        self.assertEqual(done["action"], "skip", done)
+
     def git_out(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True, text=True).stdout.strip()
 
@@ -795,6 +905,16 @@ class StagectlTests(unittest.TestCase):
              "--outcome", "pass", "--summary", "Drove totals through the CLI and saw thirty", *extra],
             capture_output=True, text=True, check=False)
         return result.returncode, json.loads(result.stdout)
+
+    def plan_at(self, repo: Path, base: str) -> tuple[int, dict]:
+        result = subprocess.run(
+            [sys.executable, "-B", str(STAGECTL), "--repo", str(repo), "--json", "reprove-plan", "--base", base],
+            capture_output=True, text=True, check=False)
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            payload = {"error": result.stderr or result.stdout}
+        return result.returncode, payload
 
     def reprove_at(self, repo: Path, stage: str, supersedes: str, base: str, *extra: str) -> tuple[int, dict]:
         result = subprocess.run(

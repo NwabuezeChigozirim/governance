@@ -1,0 +1,221 @@
+# Automatic re-proof after a rebase.
+#
+# This file runs from the default branch (workflow_run always does). A pull request
+# cannot replace it. The trigger is workflow_run, not a pull_request_target trigger.
+#
+# Forks are skipped. Fork code is never checked out, and a fork branch cannot be
+# pushed to with this repository's token.
+#
+# The job that runs the frozen checks has no signing key and a read-only token.
+# The job that holds GOVERNANCE_VERDICT_KEY only signs the verdict hash and
+# pushes the two verdict files. It does not run the checks.
+name: Reprove
+
+on:
+  workflow_run:
+    workflows: ["Verify"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reprove-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0] != null
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      stage: ${{ steps.plan.outputs.stage }}
+      supersedes: ${{ steps.plan.outputs.supersedes }}
+      contract: ${{ steps.plan.outputs.contract }}
+      base: ${{ steps.plan.outputs.base }}
+      sign: ${{ steps.plan.outputs.sign }}
+      sha: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Check out the pull request head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Check out the trusted scripts from the default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+      - name: Fetch the base branch
+        env:
+          BASE_REF: ${{ github.event.workflow_run.pull_requests[0].base.ref }}
+        run: git -C pr fetch origin "$BASE_REF"
+      - name: Decide whether a re-proof is due
+        id: plan
+        env:
+          BASE_REF: ${{ github.event.workflow_run.pull_requests[0].base.ref }}
+        run: |
+          python3 -B trusted/scripts/stagectl --repo pr --json reprove-plan --base "origin/$BASE_REF" > "$RUNNER_TEMP/plan.json"
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          plan = json.loads(pathlib.Path(os.environ["RUNNER_TEMP"], "plan.json").read_text())
+          allowed = {"skip", "reprove"}
+          if plan.get("action") not in allowed:
+              raise SystemExit(f"unexpected plan action: {plan.get('action')}")
+          lines = {
+              "action": plan["action"],
+              "stage": plan.get("stage_id", ""),
+              "supersedes": plan.get("supersedes", ""),
+              "contract": plan.get("contract", ""),
+              "base": os.environ["BASE_REF"],
+              "sign": "true" if plan.get("require_signature") else "false",
+          }
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a") as handle:
+              for key, value in lines.items():
+                  handle.write(f"{key}={value}\n")
+          print(json.dumps({key: plan.get(key) for key in ("action", "reason", "require_signature")}))
+          PY
+
+  reprove:
+    needs: plan
+    if: needs.plan.outputs.action == 'reprove'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      record: ${{ steps.run.outputs.record }}
+    steps:
+      - name: Check out the pull request head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Check out the trusted scripts from the default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+      - name: Fetch the base branch
+        env:
+          BASE_REF: ${{ needs.plan.outputs.base }}
+        run: git -C pr fetch origin "$BASE_REF"
+      - name: Drop credentials before running the checks
+        run: |
+          git -C pr config --local --unset-all http.https://github.com/.extraheader || true
+          git -C pr config --local --unset-all http.extraheader || true
+      - name: Re-run the frozen checks without a signing key
+        id: run
+        env:
+          BASE_REF: ${{ needs.plan.outputs.base }}
+          STAGE: ${{ needs.plan.outputs.stage }}
+          SUPERSEDES: ${{ needs.plan.outputs.supersedes }}
+          CONTRACT: ${{ needs.plan.outputs.contract }}
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
+        run: |
+          git -C pr config --local --unset-all http.https://github.com/.extraheader || true
+          git -C pr config --local --unset-all http.extraheader || true
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_RUNTIME_TOKEN
+          set +e
+          python3 -B trusted/scripts/stagectl --repo pr --json reprove \
+            --stage "$STAGE" --supersedes "$SUPERSEDES" --base "origin/$BASE_REF" \
+            --contract "$CONTRACT" --outcome pass --checker governance-ci \
+            --defer-signature \
+            --summary "Re-ran the frozen checks on the rebased tree after green CI" \
+            > "$RUNNER_TEMP/reprove.json"
+          code=$?
+          set -e
+          if [ "$code" != 0 ] && [ "$code" != 3 ]; then
+            echo "reprove refused; not pushing a verdict"
+            exit "$code"
+          fi
+          python3 -B - <<'PY'
+          import json, os, pathlib
+          data = json.loads(pathlib.Path(os.environ["RUNNER_TEMP"], "reprove.json").read_text())
+          record = data["record_sha256"]
+          source = pathlib.Path("pr") / ".governance" / "verdicts" / f"{record}.json"
+          if not source.is_file():
+              raise SystemExit(f"missing verdict file {source}")
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a") as handle:
+              handle.write(f"record={record}\n")
+          PY
+      - name: Upload the unsigned verdict
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdict-${{ steps.run.outputs.record }}
+          path: pr/.governance/verdicts/${{ steps.run.outputs.record }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [plan, reprove]
+    if: needs.plan.outputs.action == 'reprove' && needs.reprove.outputs.record != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the pull request head for the verdict commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Check out the trusted scripts from the default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+      - name: Download the verdict
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verdict-${{ needs.reprove.outputs.record }}
+          path: pr/.governance/verdicts
+      - name: Sign the verdict hash
+        if: needs.plan.outputs.sign == 'true'
+        env:
+          VERDICT_KEY: ${{ secrets.GOVERNANCE_VERDICT_KEY }}
+          RECORD: ${{ needs.reprove.outputs.record }}
+        run: |
+          if [ -z "$VERDICT_KEY" ]; then
+            echo "GOVERNANCE_VERDICT_KEY is not set. Not signing and not pushing."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$VERDICT_KEY" > "$RUNNER_TEMP/verdict-key"
+          unset VERDICT_KEY
+          python3 -B trusted/scripts/stagectl --repo pr sign-verdict --record "$RECORD" --key "$RUNNER_TEMP/verdict-key"
+          rm -f "$RUNNER_TEMP/verdict-key"
+      - name: Push the verdict files
+        env:
+          RECORD: ${{ needs.reprove.outputs.record }}
+          SIGN: ${{ needs.plan.outputs.sign }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [ -z "$HEAD_BRANCH" ]; then
+            echo "no pull request branch to push to"
+            exit 1
+          fi
+          git -C pr config user.name governance-ci
+          git -C pr config user.email governance-ci@users.noreply.github.com
+          git -C pr add -- ".governance/verdicts/${RECORD}.json"
+          if [ "$SIGN" = "true" ]; then
+            git -C pr add -- ".governance/verdicts/${RECORD}.sig"
+          fi
+          git -C pr diff --cached --quiet && echo "nothing to commit" && exit 0
+          git -C pr commit -q -m "Re-prove the rebased tree"
+          git -C pr push origin "HEAD:${HEAD_BRANCH}"
