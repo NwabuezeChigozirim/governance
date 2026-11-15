@@ -71,6 +71,8 @@ A receipt is bound to the exact code that was tested. Any edit afterwards makes 
 
 When `review` is `independent`, commit everything, including the contract, then hand the stage ID, the contract path, and the commit to a fresh agent with the **verify-stage** skill. Use a subagent or a cloud agent that has not seen this conversation. Give it those three, not your reasoning. A cloud agent on its own machine clones the commit and commits a verdict under `.governance/verdicts/`. Pull that commit before you close.
 
+When `.governance/config.json` sets `require_verdict_signature`, the checker's verdict must be signed with a key the owner already published in `.governance/verdict-signers` on the base branch. You do not edit that file. A key added in this pull request is not trusted for it.
+
 You cannot record the verdict yourself: `stagectl verify` refuses the worktree that did the work. On this clone, the verifier's worktree must match your committed code. On another clone, the verifier passes `--contract` and writes a verdict file you can pull. If the verdict is `fail`, fix the root cause, commit, rerun the checks, and ask for a fresh verdict. Any governed edit after a verdict makes it stale. Pulling the verdict commit changes HEAD, so run `stagectl run-check --all` again before close; the checks are stale even though the governed tree is unchanged.
 
 ## 6. Close

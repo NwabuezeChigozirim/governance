@@ -136,9 +136,10 @@ not tell you the right design.
 | `stagectl close` | Also writes `.governance/receipts/<stage>.json`: intent, acceptance, checks, verdict, and the Git tree ID of the code that was proven |
 | `stagectl gate` | Passes only when a committed receipt names the tree being checked. When that receipt's review is `independent`, a committed verdict must name the same tree. `--base` passes a change that touches no governed file. `--rerun` runs the receipt's checks again. `--markdown` writes the receipt for the pull request or the CI summary |
 
-The tree ID leaves out Git-ignored files, receipts, verdicts, contract drafts under
-`.governance/stages/` and the configured exempt paths. Any other edit after close
-changes it, so the gate fails until a new stage proves the new code.
+The tree ID leaves out Git-ignored files, receipts, verdicts, the trusted-signers
+file, contract drafts under `.governance/stages/` and the configured exempt paths.
+Any other edit after close changes it, so the gate fails until a new stage proves
+the new code.
 
 Limits: without `--rerun` the gate trusts the receipt, and a receipt is a plain file
 that an agent could write by hand through the shell (the hook only stops the edit
@@ -187,7 +188,17 @@ scripts/stagectl --repo . verify --stage ST-... --contract .governance/stages/<s
 
 The committed record is `.governance/verdicts/<record_sha256>.json`. It names who checked (`checker`), which head (`head.commit` and the governed `head.tree`), which checks ran and how they finished (`checked`), and what was seen (`evidence`). `report` is `PASS`, `FAIL`, or `INVALID`. `record_sha256` is the hash of the other fields, and the file name is that hash.
 
-`stagectl gate` recomputes the governed tree and reads the contract file the verdict names. It rejects a missing verdict, a verdict whose hash does not match its contents, a verdict for a different tree, a verdict whose commit does not contain that tree, a verdict whose contract file changed, a verdict that is missing a required field, and a re-proof whose `supersedes` link does not match the predecessor it names. The hash binds those fields together. It proves what the record says was checked. It does not prove who ran the command: anyone who can commit can write a new file with a new hash. Signing the checker is a follow-up.
+`stagectl gate` recomputes the governed tree and reads the contract file the verdict names. It rejects a missing verdict, a verdict whose hash does not match its contents, a verdict for a different tree, a verdict whose commit does not contain that tree, a verdict whose contract file changed, a verdict that is missing a required field, and a re-proof whose `supersedes` link does not match the predecessor it names. The hash binds those fields together. It proves what the record says was checked.
+
+Signing is opt-in. Set `require_verdict_signature` to `true` in `.governance/config.json` once the owner has published `.governance/verdict-signers` on the base branch. Until then, a verdict is unsigned and the gate does not ask for a signature. Existing verdicts keep working. The owner holds the trusted list: an agent cannot edit that file, and the owner changes it by committing it on the base. A key added in the pull request under review is not trusted for that pull request. The gate reads the list from the merge-base of `--base`. It also stays required when the pull request turns the flag off, if the base still has it on. Pass `--base` whenever the flag is on; without it the gate stops rather than trust this branch's list.
+
+The checker creates a key outside the repository and sends the owner only the public line:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.config/governance/verdict-key -N "" -C "<checker identity>"
+```
+
+The owner adds `<checker.identity> namespaces="governance-verdict"` plus the key type and the public key to `.governance/verdict-signers`, and commits that on the base branch before any pull request relies on it. The checker then passes the private key with `--key` or `GOVERNANCE_VERDICT_KEY`. `ssh-keygen -Y sign` writes `.governance/verdicts/<record_sha256>.sig` beside the verdict. The signed bytes are `governance-verdict-v1 <record_sha256>`. That hash covers every field, including `supersedes`, so a re-proof is signed too. The verdict JSON is unchanged, and its file name stays the record hash. The trusted line is `<checker.identity> namespaces="governance-verdict" <key type> <public key>`. The principal has to be the verdict's `checker.identity`. The gate rejects a missing signature, a signature that does not match the hash, a key that is not in the base list, and a key that is listed under a different name.
 
 A rebase onto new commits changes the tree even when the patch is the same, so the old verdict stops matching and the gate rejects it. That rejection stays. Carrying the old file forward is not allowed. After the rebase, and after CI is green on the new head, the checker runs `stagectl reprove` on a clone that does not hold the stage. Re-proof runs the frozen checks again on the new tree and writes a new verdict. It does not copy the old one.
 

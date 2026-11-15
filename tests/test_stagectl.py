@@ -444,6 +444,155 @@ class StagectlTests(unittest.TestCase):
         self.assertEqual(code, 2, out)
         self.assertIn("independent", out["error"])
 
+    def test_a_signed_verdict_is_accepted_and_a_bad_signature_is_rejected(self) -> None:
+        keys = self.repo.parent / (self.repo.name + "-keys")
+        self.addCleanup(shutil.rmtree, keys, True)
+        checker_key = self.make_key(keys, "checker")
+        alice_key = self.make_key(keys, "alice")
+        attacker_key = self.make_key(keys, "attacker")
+        self.git("branch", "-M", "main")
+        signers = self.signer_line("other-vm", checker_key) + self.signer_line("alice", alice_key)
+        self.write(".governance/verdict-signers", signers)
+        self.write(".governance/config.json", json.dumps({"require_verdict_signature": True}))
+        self.write("stage.json", json.dumps(contract(review="independent")))
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "trust the checker")
+        self.git("checkout", "-q", "-b", "feature")
+        self.write("app.py", "def total(days, rate):\n    if days < 0:\n        raise ValueError('days')\n    return days * rate\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "reject negative days")
+        code, frozen = self.ctl("freeze", "--contract", "stage.json", "--owner-approved")
+        self.assertEqual(code, 0, frozen)
+        self.assertEqual(self.ctl("run-check", "--all")[0], 0)
+        stage = frozen["stage_id"]
+        remote = self.repo.parent / (self.repo.name + "-remote.git")
+        checker = self.repo.parent / (self.repo.name + "-checker")
+        self.addCleanup(shutil.rmtree, remote, True)
+        self.addCleanup(shutil.rmtree, checker, True)
+        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(remote), "symbolic-ref", "HEAD", "refs/heads/feature"], check=True)
+        self.git("remote", "add", "origin", str(remote))
+        self.git("push", "-q", "-u", "origin", "main")
+        self.git("push", "-q", "-u", "origin", "feature")
+        subprocess.run(["git", "clone", "-q", str(remote), str(checker)], check=True)
+        self.assertNotEqual(self.common_dir(self.repo), self.common_dir(checker))
+
+        missing_key = self.verify_at(checker, stage, "--contract", "stage.json", "--checker", "other-vm")
+        self.assertEqual(missing_key[0], 2, missing_key[1])
+        self.assertIn("signed verdict", missing_key[1]["error"])
+        code, recorded = self.verify_at(
+            checker, stage, "--contract", "stage.json", "--checker", "other-vm", "--key", str(checker_key))
+        self.assertEqual(code, 0, recorded)
+        self.assertTrue(recorded["signed"])
+        body = json.loads((checker / recorded["verdict"]).read_text(encoding="utf-8"))
+        self.assertNotIn("signature", body)
+        self.assertEqual(body["checker"]["identity"], "other-vm")
+        sig = checker / ".governance" / "verdicts" / f"{body['record_sha256']}.sig"
+        self.assertIn(b"BEGIN SSH SIGNATURE", sig.read_bytes())
+        self.git_at(checker, "add", "-A")
+        self.git_at(checker, "commit", "-q", "-m", "signed verdict")
+        self.git_at(checker, "push", "-q")
+        self.git("pull", "-q", "--ff-only")
+        self.assertEqual(self.ctl("run-check", "--all")[0], 0)
+        self.assertEqual(self.ctl("close")[0], 0)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "receipt")
+        self.git("push", "-q")
+        self.assertEqual(self.ctl("gate", "--base", "main")[0], 0)
+        proven = self.git_out("rev-parse", "HEAD")
+        verdict_path = self.repo / ".governance" / "verdicts" / f"{body['record_sha256']}.json"
+        sig_path = verdict_path.with_suffix(".sig")
+        honest_json = verdict_path.read_text(encoding="utf-8")
+        honest_sig = sig_path.read_bytes()
+
+        sig_path.unlink()
+        self.assertEqual(self.codes(self.ctl("gate", "--base", "main")[1]), {"verdict-unsigned"})
+        sig_path.write_bytes(honest_sig)
+
+        tampered = json.loads(honest_json)
+        tampered["evidence"]["summary"] = "changed after the signature was made"
+        tampered["record_sha256"] = canon({k: v for k, v in tampered.items() if k != "record_sha256"})
+        forged = verdict_path.parent / f"{tampered['record_sha256']}.json"
+        verdict_path.unlink()
+        forged.write_text(json.dumps(tampered), encoding="utf-8")
+        forged.with_suffix(".sig").write_bytes(honest_sig)
+        self.assertIn("verdict-signature", self.codes(self.ctl("gate", "--base", "main")[1]))
+        forged.unlink()
+        forged.with_suffix(".sig").unlink()
+        verdict_path.write_text(honest_json, encoding="utf-8")
+        sig_path.write_bytes(honest_sig)
+
+        self.sign_hash(attacker_key, body["record_sha256"], sig_path)
+        self.assertIn("verdict-untrusted", self.codes(self.ctl("gate", "--base", "main")[1]))
+        self.sign_hash(alice_key, body["record_sha256"], sig_path)
+        self.assertIn("verdict-identity", self.codes(self.ctl("gate", "--base", "main")[1]))
+        sig_path.write_bytes(honest_sig)
+        self.assertEqual(self.ctl("gate", "--base", "main")[0], 0)
+
+        self.write(".governance/verdict-signers", signers + self.signer_line("other-vm", attacker_key))
+        self.sign_hash(attacker_key, body["record_sha256"], sig_path)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "trust a key added on this branch")
+        self.assertIn("verdict-untrusted", self.codes(self.ctl("gate", "--base", "main")[1]))
+        self.git("reset", "-q", "--hard", proven)
+
+        self.write(".governance/config.json", json.dumps({"require_verdict_signature": False}))
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "turn signing off")
+        self.git("push", "-q")
+        self.git_at(checker, "fetch", "-q", "origin")
+        self.git_at(checker, "reset", "-q", "--hard", "origin/feature")
+        code, resigned = self.verify_at(
+            checker, stage, "--contract", "stage.json", "--checker", "other-vm", "--key", str(checker_key))
+        self.assertEqual(code, 0, resigned)
+        self.git_at(checker, "add", "-A")
+        self.git_at(checker, "commit", "-q", "-m", "signed despite the flag")
+        self.git_at(checker, "push", "-q")
+        self.git("pull", "-q", "--ff-only")
+        fresh = json.loads((self.repo / ".governance" / "verdicts" / Path(resigned["verdict"]).name).read_text(encoding="utf-8"))
+        receipt_path = self.repo / ".governance" / "receipts" / f"{stage}.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["tree"] = fresh["head"]["tree"]
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        self.assertEqual(self.ctl("gate", "--base", "main")[0], 0)
+        fresh_sig = self.repo / ".governance" / "verdicts" / f"{fresh['record_sha256']}.sig"
+        fresh_sig.unlink()
+        self.assertIn("verdict-unsigned", self.codes(self.ctl("gate", "--base", "main")[1]))
+        self.git("reset", "-q", "--hard", proven)
+
+        self.git("checkout", "-q", "main")
+        self.write("notes.md", "a note on main\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "notes")
+        self.git("push", "-q")
+        self.git("checkout", "-q", "feature")
+        self.git("rebase", "main")
+        self.git("push", "-q", "--force-with-lease")
+        self.git_at(checker, "fetch", "-q", "origin")
+        self.git_at(checker, "reset", "-q", "--hard", "origin/feature")
+        code, again = self.reprove_at(
+            checker, stage, body["record_sha256"], "origin/main", "--checker", "other-vm", "--key", str(checker_key))
+        self.assertEqual(code, 0, again)
+        self.assertTrue(again["signed"])
+        second = json.loads((checker / again["verdict"]).read_text(encoding="utf-8"))
+        self.assertEqual(second["supersedes"]["record_sha256"], body["record_sha256"])
+        self.assertNotEqual(second["record_sha256"], body["record_sha256"])
+        second_sig = checker / ".governance" / "verdicts" / f"{second['record_sha256']}.sig"
+        self.assertTrue(second_sig.is_file())
+        self.assertNotEqual(second_sig.read_bytes(), honest_sig)
+        self.git_at(checker, "add", "-A")
+        self.git_at(checker, "commit", "-q", "-m", "signed reproof")
+        self.git_at(checker, "push", "-q")
+        self.git("pull", "-q", "--ff-only")
+        code, resumed = self.ctl("resume")
+        self.assertEqual(code, 0, resumed)
+        self.assertEqual(self.ctl("run-check", "--all")[0], 0)
+        self.assertEqual(self.ctl("close")[0], 0)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "rebased receipt")
+        self.assertEqual(self.ctl("gate", "--base", "main")[0], 0)
+        self.assertEqual(self.ctl("gate", "--base", "main")[1]["verdict"], second["record_sha256"])
+
     def test_rebase_reproof_records_a_fresh_verdict_and_rejects_a_changed_or_failed_run(self) -> None:
         self.git("branch", "-M", "main")
         self.write("flag.txt", "ok\n")
@@ -658,6 +807,25 @@ class StagectlTests(unittest.TestCase):
         except json.JSONDecodeError:
             payload = {"error": result.stderr or result.stdout}
         return result.returncode, payload
+
+    def make_key(self, directory: Path, name: str) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-f", str(path), "-N", "", "-q"], check=True)
+        return path
+
+    def signer_line(self, principal: str, private_key: Path) -> str:
+        kind, material, *_rest = (private_key.with_suffix(".pub")).read_text(encoding="utf-8").split()
+        return f'{principal} namespaces="governance-verdict" {kind} {material}\n'
+
+    def sign_hash(self, key: Path, record: str, dest: Path) -> None:
+        message = f"governance-verdict-v1 {record}\n".encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = Path(tmp) / "verdict"
+            payload.write_bytes(message)
+            subprocess.run(["ssh-keygen", "-Y", "sign", "-f", str(key), "-n", "governance-verdict", str(payload)],
+                           check=True, capture_output=True)
+            dest.write_bytes(payload.with_suffix(".sig").read_bytes())
 
 
 if __name__ == "__main__":
